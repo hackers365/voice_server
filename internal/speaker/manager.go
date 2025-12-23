@@ -1,12 +1,8 @@
 package speaker
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"math"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -15,33 +11,16 @@ import (
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
-// SpeakerData 声纹数据结构
-type SpeakerData struct {
-	ID          string      `json:"id"`
-	Name        string      `json:"name"`
-	Embeddings  [][]float32 `json:"embeddings"`
-	CreatedAt   time.Time   `json:"created_at"`
-	UpdatedAt   time.Time   `json:"updated_at"`
-	SampleCount int         `json:"sample_count"`
-}
-
-// SpeakerDatabase 声纹数据库结构
-type SpeakerDatabase struct {
-	Speakers  map[string]*SpeakerData `json:"speakers"`
-	Version   string                  `json:"version"`
-	UpdatedAt time.Time               `json:"updated_at"`
-}
-
 // Manager 声纹识别管理器
 type Manager struct {
 	extractor    *sherpa.SpeakerEmbeddingExtractor
-	manager      *sherpa.SpeakerEmbeddingManager
-	database     *SpeakerDatabase
-	dbPath       string
 	threshold    float32
 	embeddingDim int
-	mutex        sync.RWMutex
 	dataDir      string
+
+	// Qdrant 向量数据库客户端（唯一存储）
+	vectorDB      *QdrantVectorDB
+	vectorDBMutex sync.RWMutex
 }
 
 // Config 声纹识别配置
@@ -50,14 +29,23 @@ type Config struct {
 	NumThreads int     `json:"num_threads"`
 	Provider   string  `json:"provider"`
 	Threshold  float32 `json:"threshold"`
-	DataDir    string  `json:"data_dir"`
+	DataDir    string  `json:"data_dir"` // 保留用于其他用途（如临时文件）
+
+	// 向量数据库配置（必需）
+	VectorDB struct {
+		Host           string `json:"host"`            // Qdrant 地址，默认 localhost
+		Port           int    `json:"port"`            // Qdrant 端口，默认 6334
+		CollectionName string `json:"collection_name"` // Collection 名称，默认 speaker_embeddings
+	} `json:"vector_db"`
 }
 
 // NewManager 创建声纹识别管理器
 func NewManager(config *Config) (*Manager, error) {
-	// 确保数据目录存在
-	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %v", err)
+	// 确保数据目录存在（用于其他用途，如临时文件）
+	if config.DataDir != "" {
+		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create data directory: %v", err)
+		}
 	}
 
 	// 创建声纹特征提取器配置
@@ -78,110 +66,57 @@ func NewManager(config *Config) (*Manager, error) {
 	dim := extractor.Dim()
 	logger.Infof("Speaker embedding dimension: %d", dim)
 
-	// 创建声纹管理器
-	embeddingManager := sherpa.NewSpeakerEmbeddingManager(dim)
-	if embeddingManager == nil {
-		sherpa.DeleteSpeakerEmbeddingExtractor(extractor)
-		return nil, fmt.Errorf("failed to create speaker embedding manager")
+	// 初始化 Qdrant 向量数据库
+	qdrantConfig := &QdrantConfig{
+		Host:           config.VectorDB.Host,
+		Port:           config.VectorDB.Port,
+		CollectionName: config.VectorDB.CollectionName,
+	}
+
+	// 设置默认值
+	if qdrantConfig.Host == "" {
+		qdrantConfig.Host = "localhost"
+	}
+	if qdrantConfig.Port == 0 {
+		qdrantConfig.Port = 6334
+	}
+	if qdrantConfig.CollectionName == "" {
+		qdrantConfig.CollectionName = "speaker_embeddings"
+	}
+
+	vectorDB, err := NewQdrantVectorDB(qdrantConfig, dim)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize vector database: %v", err)
 	}
 
 	manager := &Manager{
 		extractor:    extractor,
-		manager:      embeddingManager,
 		threshold:    config.Threshold,
 		embeddingDim: dim,
 		dataDir:      config.DataDir,
-		dbPath:       filepath.Join(config.DataDir, "speaker.json"),
+		vectorDB:     vectorDB,
 	}
 
-	// 加载现有数据库
-	if err := manager.loadDatabase(); err != nil {
-		logger.Infof("Warning: failed to load existing database: %v", err)
-		manager.database = &SpeakerDatabase{
-			Speakers:  make(map[string]*SpeakerData),
-			Version:   "1.0.0",
-			UpdatedAt: time.Now(),
-		}
-	}
-
-	// 将数据库中的声纹加载到内存管理器
-	if err := manager.loadSpeakersToMemory(); err != nil {
-		logger.Infof("Warning: failed to load speakers to memory: %v", err)
-	}
-
+	logger.Infof("✅ Speaker Manager initialized with Qdrant vector database")
 	return manager, nil
 }
 
 // Close 关闭管理器并释放资源
 func (m *Manager) Close() {
+	// 关闭向量数据库连接
+	if m.vectorDB != nil {
+		m.vectorDB.Close()
+	}
+
+	// 释放提取器
 	if m.extractor != nil {
 		sherpa.DeleteSpeakerEmbeddingExtractor(m.extractor)
 	}
-	if m.manager != nil {
-		sherpa.DeleteSpeakerEmbeddingManager(m.manager)
-	}
+
+	logger.Infof("Speaker Manager closed, all resources released")
 }
 
-// loadDatabase 从文件加载声纹数据库
-func (m *Manager) loadDatabase() error {
-	if _, err := os.Stat(m.dbPath); os.IsNotExist(err) {
-		return fmt.Errorf("database file does not exist")
-	}
-
-	data, err := ioutil.ReadFile(m.dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to read database file: %v", err)
-	}
-
-	var db SpeakerDatabase
-	if err := json.Unmarshal(data, &db); err != nil {
-		return fmt.Errorf("failed to unmarshal database: %v", err)
-	}
-
-	m.database = &db
-	return nil
-}
-
-// saveDatabase 保存声纹数据库到文件
-func (m *Manager) saveDatabase() error {
-	m.database.UpdatedAt = time.Now()
-
-	data, err := json.MarshalIndent(m.database, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal database: %v", err)
-	}
-
-	if err := ioutil.WriteFile(m.dbPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write database file: %v", err)
-	}
-
-	return nil
-}
-
-// loadSpeakersToMemory 将数据库中的声纹加载到内存管理器
-func (m *Manager) loadSpeakersToMemory() error {
-	loadedCount := 0
-	totalEmbeddings := 0
-
-	for speakerID, speakerData := range m.database.Speakers {
-		if len(speakerData.Embeddings) > 0 {
-			// 注册多个嵌入向量
-			success := m.manager.RegisterV(speakerID, speakerData.Embeddings)
-			if !success {
-				logger.Infof("Warning: failed to register speaker %s to memory", speakerID)
-			} else {
-				loadedCount++
-				totalEmbeddings += len(speakerData.Embeddings)
-			}
-		}
-	}
-
-	logger.Infof("✅ Loaded %d speakers with %d total embeddings to memory for fast recognition",
-		loadedCount, totalEmbeddings)
-	return nil
-}
-
-// extractEmbedding 从音频数据提取声纹特征
+// extractEmbedding 从音频数据提取声纹特征（私有方法）
 func (m *Manager) extractEmbedding(audioData []float32, sampleRate int) ([]float32, error) {
 	// 创建音频流
 	stream := m.extractor.CreateStream()
@@ -202,54 +137,28 @@ func (m *Manager) extractEmbedding(audioData []float32, sampleRate int) ([]float
 		return nil, fmt.Errorf("failed to extract embedding")
 	}
 
+	// 注意：不需要手动归一化向量
+	// Qdrant 在使用 Distance_Cosine 时会自动归一化向量（存储和查询时都会自动处理）
+	// 这样可以确保向量存储和搜索的一致性，并提高搜索效率
+
 	return embedding, nil
 }
 
-// calculateSimilarity 计算声纹特征向量的相似度
-func (m *Manager) calculateSimilarity(queryEmbedding []float32, storedEmbeddings [][]float32) float32 {
-	if len(storedEmbeddings) == 0 {
-		return 0.0
-	}
-
-	maxSimilarity := float32(0.0)
-
-	// 与所有存储的特征向量计算余弦相似度，取最大值
-	for _, embedding := range storedEmbeddings {
-		similarity := cosineSimilarity(queryEmbedding, embedding)
-		if similarity > maxSimilarity {
-			maxSimilarity = similarity
-		}
-	}
-
-	return maxSimilarity
+// ExtractEmbedding 从音频数据提取声纹特征（公开方法，供外部调用）
+func (m *Manager) ExtractEmbedding(audioData []float32, sampleRate int) ([]float32, error) {
+	return m.extractEmbedding(audioData, sampleRate)
 }
 
-// cosineSimilarity 计算两个向量的余弦相似度
-func cosineSimilarity(a, b []float32) float32 {
-	if len(a) != len(b) {
-		return 0.0
-	}
-
-	var dotProduct, normA, normB float32
-
-	for i := 0; i < len(a); i++ {
-		dotProduct += a[i] * b[i]
-		normA += a[i] * a[i]
-		normB += b[i] * b[i]
-	}
-
-	if normA == 0 || normB == 0 {
-		return 0.0
-	}
-
-	similarity := dotProduct / (float32(math.Sqrt(float64(normA))) * float32(math.Sqrt(float64(normB))))
-	return similarity
+// GetEmbeddingDim 获取 embedding 维度
+func (m *Manager) GetEmbeddingDim() int {
+	return m.embeddingDim
 }
 
-// RegisterSpeaker 注册声纹
-func (m *Manager) RegisterSpeaker(speakerID, speakerName string, audioData []float32, sampleRate int) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+// RegisterSpeaker 注册声纹（支持 UID 维度隔离）
+func (m *Manager) RegisterSpeaker(uid, speakerID, speakerName string, audioData []float32, sampleRate int) error {
+	if uid == "" {
+		return fmt.Errorf("uid is required")
+	}
 
 	// 提取声纹特征
 	embedding, err := m.extractEmbedding(audioData, sampleRate)
@@ -257,47 +166,42 @@ func (m *Manager) RegisterSpeaker(speakerID, speakerName string, audioData []flo
 		return fmt.Errorf("failed to extract embedding: %v", err)
 	}
 
-	// 检查说话人是否已存在
-	speakerData, exists := m.database.Speakers[speakerID]
-	if !exists {
-		// 创建新的说话人数据
-		speakerData = &SpeakerData{
-			ID:          speakerID,
-			Name:        speakerName,
-			Embeddings:  [][]float32{},
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
-			SampleCount: 0,
-		}
-		m.database.Speakers[speakerID] = speakerData
+	// 验证嵌入向量维度
+	if len(embedding) != m.embeddingDim {
+		return fmt.Errorf("embedding dimension mismatch: expected %d, got %d", m.embeddingDim, len(embedding))
 	}
 
-	// 添加新的嵌入向量
-	speakerData.Embeddings = append(speakerData.Embeddings, embedding)
-	speakerData.UpdatedAt = time.Now()
-	speakerData.SampleCount++
-	speakerData.Name = speakerName // 更新名称
-
-	// 注册到内存管理器
-	success := m.manager.RegisterV(speakerID, speakerData.Embeddings)
-	if !success {
-		return fmt.Errorf("failed to register speaker to memory manager")
+	// 查询该 speaker 已存在的样本数量（用于确定 sample_index）
+	sampleIndex, err := m.vectorDB.GetSpeakerSampleCount(uid, speakerID)
+	if err != nil {
+		// 如果查询失败，可能是 speaker 不存在，从 0 开始
+		sampleIndex = 0
 	}
 
-	// 保存到文件
-	if err := m.saveDatabase(); err != nil {
-		return fmt.Errorf("failed to save database: %v", err)
+	// 插入到 Qdrant 向量数据库
+	now := time.Now().Unix()
+	err = m.vectorDB.Insert(uid, speakerID, speakerName, embedding, sampleIndex, now, now)
+	if err != nil {
+		return fmt.Errorf("failed to insert to vector database: %v", err)
 	}
 
-	logger.Infof("Successfully registered speaker %s (%s) with %d samples",
-		speakerID, speakerName, speakerData.SampleCount)
+	logger.Infof("Successfully registered speaker %s (%s) for uid %s, sample index: %d",
+		speakerID, speakerName, uid, sampleIndex)
 	return nil
 }
 
-// IdentifySpeaker 识别声纹（直接使用内存中的数据进行高效对比）
-func (m *Manager) IdentifySpeaker(audioData []float32, sampleRate int) (*IdentifyResult, error) {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
+// IdentifySpeaker 识别声纹（支持 UID 维度隔离）
+// threshold: 识别阈值，如果 <= 0 则使用默认阈值
+func (m *Manager) IdentifySpeaker(uid string, audioData []float32, sampleRate int, threshold ...float32) (*IdentifyResult, error) {
+	if uid == "" {
+		return nil, fmt.Errorf("uid is required")
+	}
+
+	// 确定使用的阈值：如果传入了有效的阈值（> 0），使用传入的；否则使用默认阈值
+	useThreshold := m.threshold
+	if len(threshold) > 0 && threshold[0] > 0 {
+		useThreshold = threshold[0]
+	}
 
 	// 提取声纹特征
 	embedding, err := m.extractEmbedding(audioData, sampleRate)
@@ -305,43 +209,35 @@ func (m *Manager) IdentifySpeaker(audioData []float32, sampleRate int) (*Identif
 		return nil, fmt.Errorf("failed to extract embedding: %v", err)
 	}
 
-	// 在内存管理器中搜索最佳匹配（已加载的声纹数据直接内存对比）
-	speakerID := m.manager.Search(embedding, m.threshold)
+	// 在 Qdrant 向量数据库中搜索（按 UID 过滤，返回 top 1）
+	results, err := m.vectorDB.Search(uid, embedding, useThreshold, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search in vector database: %v", err)
+	}
 
 	result := &IdentifyResult{
 		Identified:  false,
 		SpeakerID:   "",
 		SpeakerName: "",
 		Confidence:  0.0,
-		Threshold:   m.threshold,
+		Threshold:   useThreshold,
 	}
 
-	if speakerID != "" {
-		// 找到匹配的说话人
-		speakerData, exists := m.database.Speakers[speakerID]
-		if exists {
-			result.Identified = true
-			result.SpeakerID = speakerID
-			result.SpeakerName = speakerData.Name
-
-			// 计算精确的相似度分数
-			confidence := m.calculateSimilarity(embedding, speakerData.Embeddings)
-			result.Confidence = confidence
-		}
+	if len(results) > 0 {
+		bestMatch := results[0]
+		result.Identified = true
+		result.SpeakerID = bestMatch.SpeakerID
+		result.SpeakerName = bestMatch.SpeakerName
+		result.Confidence = bestMatch.Confidence
 	}
 
 	return result, nil
 }
 
-// VerifySpeaker 验证声纹（直接使用内存中的数据进行高效对比）
-func (m *Manager) VerifySpeaker(speakerID string, audioData []float32, sampleRate int) (*VerifyResult, error) {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	// 检查说话人是否存在
-	speakerData, exists := m.database.Speakers[speakerID]
-	if !exists {
-		return nil, fmt.Errorf("speaker %s not found", speakerID)
+// VerifySpeaker 验证声纹（支持 UID 维度隔离）
+func (m *Manager) VerifySpeaker(uid, speakerID string, audioData []float32, sampleRate int) (*VerifyResult, error) {
+	if uid == "" {
+		return nil, fmt.Errorf("uid is required")
 	}
 
 	// 提取声纹特征
@@ -350,68 +246,68 @@ func (m *Manager) VerifySpeaker(speakerID string, audioData []float32, sampleRat
 		return nil, fmt.Errorf("failed to extract embedding: %v", err)
 	}
 
-	// 计算精确的相似度分数
-	confidence := m.calculateSimilarity(embedding, speakerData.Embeddings)
-	verified := confidence >= m.threshold
+	// 在 Qdrant 中搜索该 speaker 的所有样本
+	// Filter: uid = xxx AND speaker_id = xxx
+	results, err := m.vectorDB.SearchWithFilter(uid, speakerID, embedding, m.threshold, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search in vector database: %v", err)
+	}
 
-	result := &VerifyResult{
+	verified := len(results) > 0
+	confidence := float32(0.0)
+	speakerName := ""
+
+	if verified {
+		confidence = results[0].Confidence
+		speakerName = results[0].SpeakerName
+	} else {
+		// 如果未找到，尝试获取 speaker 信息（验证是否存在）
+		speakerInfo, err := m.vectorDB.GetSpeakerInfo(uid, speakerID)
+		if err != nil {
+			return nil, fmt.Errorf("speaker %s not found", speakerID)
+		}
+		speakerName = speakerInfo.Name
+	}
+
+	return &VerifyResult{
 		SpeakerID:   speakerID,
-		SpeakerName: speakerData.Name,
+		SpeakerName: speakerName,
 		Verified:    verified,
 		Confidence:  confidence,
 		Threshold:   m.threshold,
-	}
-
-	return result, nil
+	}, nil
 }
 
-// GetAllSpeakers 获取所有注册的说话人
-func (m *Manager) GetAllSpeakers() []*SpeakerInfo {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	speakers := make([]*SpeakerInfo, 0, len(m.database.Speakers))
-	for _, speakerData := range m.database.Speakers {
-		speakers = append(speakers, &SpeakerInfo{
-			ID:          speakerData.ID,
-			Name:        speakerData.Name,
-			SampleCount: speakerData.SampleCount,
-			CreatedAt:   speakerData.CreatedAt,
-			UpdatedAt:   speakerData.UpdatedAt,
-		})
+// GetAllSpeakers 获取指定 UID 的所有注册的说话人
+func (m *Manager) GetAllSpeakers(uid string) []*SpeakerInfo {
+	speakers, err := m.vectorDB.GetAllSpeakers(uid)
+	if err != nil {
+		logger.Errorf("Failed to get speakers from vector database: %v", err)
+		return []*SpeakerInfo{}
 	}
-
 	return speakers
 }
 
-// DeleteSpeaker 删除说话人
-func (m *Manager) DeleteSpeaker(speakerID string) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	// 检查说话人是否存在
-	if _, exists := m.database.Speakers[speakerID]; !exists {
-		return fmt.Errorf("speaker %s not found", speakerID)
+// DeleteSpeaker 删除说话人（支持 UID 维度隔离）
+func (m *Manager) DeleteSpeaker(uid, speakerID string) error {
+	if uid == "" {
+		return fmt.Errorf("uid is required")
 	}
 
-	// 从数据库删除
-	delete(m.database.Speakers, speakerID)
-
-	// 从内存管理器删除
-	m.manager.Remove(speakerID)
-
-	// 保存到文件
-	if err := m.saveDatabase(); err != nil {
-		return fmt.Errorf("failed to save database: %v", err)
+	// 从 Qdrant 向量数据库删除
+	err := m.vectorDB.DeleteSpeaker(uid, speakerID)
+	if err != nil {
+		return fmt.Errorf("failed to delete from vector database: %v", err)
 	}
 
-	logger.Infof("Successfully deleted speaker %s", speakerID)
+	logger.Infof("Successfully deleted speaker %s for uid %s", speakerID, uid)
 	return nil
 }
 
-// GetStats 获取统计信息（用于主服务监控）
-func (m *Manager) GetStats() map[string]interface{} {
-	stats := m.GetDatabaseStats()
+// GetStats 获取统计信息（用于主服务监控，支持按 UID 过滤）
+func (m *Manager) GetStats(uid string) map[string]interface{} {
+	stats := m.GetDatabaseStats(uid)
+
 	return map[string]interface{}{
 		"speaker_count": stats.TotalSpeakers,
 		"total_samples": stats.TotalSamples,
@@ -422,23 +318,34 @@ func (m *Manager) GetStats() map[string]interface{} {
 	}
 }
 
-// GetDatabaseStats 获取数据库统计信息
-func (m *Manager) GetDatabaseStats() *DatabaseStats {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
+// GetDatabaseStats 获取数据库统计信息（支持按 UID 过滤）
+func (m *Manager) GetDatabaseStats(uid string) *DatabaseStats {
+	// 从向量数据库获取统计信息
+	speakers, err := m.vectorDB.GetAllSpeakers(uid)
+	if err != nil {
+		logger.Errorf("Failed to get speakers from vector database: %v", err)
+		return &DatabaseStats{
+			TotalSpeakers: 0,
+			TotalSamples:  0,
+			EmbeddingDim:  m.embeddingDim,
+			Threshold:     m.threshold,
+			Version:       "2.0.0",
+			UpdatedAt:     time.Now(),
+		}
+	}
 
 	totalSamples := 0
-	for _, speaker := range m.database.Speakers {
+	for _, speaker := range speakers {
 		totalSamples += speaker.SampleCount
 	}
 
 	return &DatabaseStats{
-		TotalSpeakers: len(m.database.Speakers),
+		TotalSpeakers: len(speakers),
 		TotalSamples:  totalSamples,
 		EmbeddingDim:  m.embeddingDim,
 		Threshold:     m.threshold,
-		Version:       m.database.Version,
-		UpdatedAt:     m.database.UpdatedAt,
+		Version:       "2.0.0",
+		UpdatedAt:     time.Now(),
 	}
 }
 
@@ -474,4 +381,131 @@ type DatabaseStats struct {
 	Threshold     float32   `json:"threshold"`
 	Version       string    `json:"version"`
 	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// StreamingIdentifier 流式声纹识别器
+type StreamingIdentifier struct {
+	manager    *Manager
+	uid        string // 用户ID
+	stream     *sherpa.OnlineStream
+	sampleRate int
+	threshold  float32 // 识别阈值，如果 <= 0 则使用默认阈值
+	mutex      sync.Mutex
+	isFinished bool
+}
+
+// NewStreamingIdentifier 创建流式识别器（支持 UID 维度隔离）
+// threshold: 识别阈值，如果 <= 0 则使用默认阈值
+func (m *Manager) NewStreamingIdentifier(uid string, sampleRate int, threshold ...float32) *StreamingIdentifier {
+	stream := m.extractor.CreateStream()
+	useThreshold := m.threshold
+	if len(threshold) > 0 && threshold[0] > 0 {
+		useThreshold = threshold[0]
+	}
+	return &StreamingIdentifier{
+		manager:    m,
+		uid:        uid,
+		stream:     stream,
+		sampleRate: sampleRate,
+		threshold:  useThreshold,
+		isFinished: false,
+	}
+}
+
+// AcceptAudio 接收音频数据块（流式输入）
+func (si *StreamingIdentifier) AcceptAudio(audioData []float32) error {
+	si.mutex.Lock()
+	defer si.mutex.Unlock()
+
+	if si.isFinished {
+		return fmt.Errorf("stream already finished")
+	}
+
+	if si.stream == nil {
+		return fmt.Errorf("stream is nil")
+	}
+
+	// 接受音频数据块
+	si.stream.AcceptWaveform(si.sampleRate, audioData)
+	return nil
+}
+
+// FinishAndIdentify 完成输入并识别声纹
+func (si *StreamingIdentifier) FinishAndIdentify() (*IdentifyResult, error) {
+	si.mutex.Lock()
+	defer si.mutex.Unlock()
+
+	if si.isFinished {
+		return nil, fmt.Errorf("stream already finished")
+	}
+
+	if si.stream == nil {
+		return nil, fmt.Errorf("stream is nil")
+	}
+
+	// 标记输入完成
+	si.stream.InputFinished()
+	si.isFinished = true
+
+	// 检查是否准备就绪
+	if !si.manager.extractor.IsReady(si.stream) {
+		si.cleanup()
+		return nil, fmt.Errorf("insufficient audio data for embedding extraction")
+	}
+
+	// 提取特征
+	embedding := si.manager.extractor.Compute(si.stream)
+	if len(embedding) == 0 {
+		si.cleanup()
+		return nil, fmt.Errorf("failed to extract embedding")
+	}
+
+	// 确定使用的阈值：如果设置了自定义阈值则使用，否则使用默认阈值
+	useThreshold := si.manager.threshold
+	if si.threshold > 0 {
+		useThreshold = si.threshold
+	}
+
+	// 在 Qdrant 向量数据库中搜索（按 UID 过滤，返回 top 1）
+	results, err := si.manager.vectorDB.Search(si.uid, embedding, useThreshold, 1)
+	if err != nil {
+		si.cleanup()
+		return nil, fmt.Errorf("failed to search in vector database: %v", err)
+	}
+
+	result := &IdentifyResult{
+		Identified:  false,
+		SpeakerID:   "",
+		SpeakerName: "",
+		Confidence:  0.0,
+		Threshold:   useThreshold,
+	}
+
+	if len(results) > 0 {
+		bestMatch := results[0]
+		result.Identified = true
+		result.SpeakerID = bestMatch.SpeakerID
+		result.SpeakerName = bestMatch.SpeakerName
+		result.Confidence = bestMatch.Confidence
+	}
+
+	// 清理资源
+	si.cleanup()
+
+	return result, nil
+}
+
+// cleanup 清理资源
+func (si *StreamingIdentifier) cleanup() {
+	if si.stream != nil {
+		sherpa.DeleteOnlineStream(si.stream)
+		si.stream = nil
+	}
+}
+
+// Close 关闭流式识别器并释放资源
+func (si *StreamingIdentifier) Close() {
+	si.mutex.Lock()
+	defer si.mutex.Unlock()
+	si.cleanup()
 }

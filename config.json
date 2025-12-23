@@ -34,6 +34,7 @@
       }
   },
   "recognition": {
+    "enabled": false,
     "model_path": "models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx",
     "tokens_path": "models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt",
     "language": "auto",
@@ -48,7 +49,12 @@
     "num_threads": 8,
     "provider": "cpu",
     "threshold": 0.6,
-    "data_dir": "data/speaker"
+    "data_dir": "data/speaker",
+    "vector_db": {
+      "host": "localhost",
+      "port": 6334,
+      "collection_name": "speaker_embeddings"
+    }
   },
   "audio": {
     "sample_rate": 16000,

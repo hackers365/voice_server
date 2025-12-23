@@ -28,6 +28,7 @@ type Config struct {
 	} `mapstructure:"session"`
 	VAD         VADConfig `mapstructure:"vad"`
 	Recognition struct {
+		Enabled                     bool   `mapstructure:"enabled"`
 		ModelPath                   string `mapstructure:"model_path"`
 		TokensPath                  string `mapstructure:"tokens_path"`
 		Language                    string `mapstructure:"language"`
@@ -43,6 +44,11 @@ type Config struct {
 		Provider   string  `mapstructure:"provider"`
 		Threshold  float32 `mapstructure:"threshold"`
 		DataDir    string  `mapstructure:"data_dir"`
+		VectorDB   struct {
+			Host           string `mapstructure:"host"`
+			Port           int    `mapstructure:"port"`
+			CollectionName string `mapstructure:"collection_name"`
+		} `mapstructure:"vector_db"`
 	} `mapstructure:"speaker"`
 	Audio struct {
 		SampleRate      int     `mapstructure:"sample_rate"`

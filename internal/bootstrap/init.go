@@ -87,38 +87,45 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 		logger.Warnf("Failed to start config file watching, continuing without hot reload: %v", err)
 	}
 
-	// 初始化全局识别器
-	logger.Infof("🔧 Initializing global recognizer...")
-	globalRecognizer, err := createRecognizer(cfg)
-	if err != nil {
-		logger.Errorf("Failed to initialize global recognizer: %v", err)
-		return nil, fmt.Errorf("failed to initialize global recognizer: %v", err)
-	}
-
-	// 根据VAD类型初始化VAD池
+	// 初始化全局识别器和VAD池（仅在recognition启用时初始化）
+	var globalRecognizer *sherpa.OfflineRecognizer
 	var vadPool pool.VADPoolInterface
-	vadFactory := pool.NewVADFactory()
 
-	if config.GlobalConfig.VAD.Provider == pool.SILERO_TYPE {
-		// 检查VAD模型文件是否存在（仅对silero需要）
-		if _, err := os.Stat(cfg.VAD.SileroVAD.ModelPath); os.IsNotExist(err) {
-			logger.Errorf("VAD model file not found, model_path=%s", cfg.VAD.SileroVAD.ModelPath)
-			return nil, fmt.Errorf("VAD model file not found: %s", cfg.VAD.SileroVAD.ModelPath)
+	if cfg.Recognition.Enabled {
+		// 初始化全局识别器
+		logger.Infof("🔧 Initializing global recognizer...")
+		globalRecognizer, err = createRecognizer(cfg)
+		if err != nil {
+			logger.Errorf("Failed to initialize global recognizer: %v", err)
+			return nil, fmt.Errorf("failed to initialize global recognizer: %v", err)
 		}
-	}
 
-	// 使用工厂创建VAD池
-	vadPool, err = vadFactory.CreateVADPool()
-	if err != nil {
-		logger.Errorf("Failed to create VAD pool: %v", err)
-		return nil, fmt.Errorf("failed to create VAD pool: %v", err)
-	}
+		// 根据VAD类型初始化VAD池
+		vadFactory := pool.NewVADFactory()
 
-	// 初始化VAD池
-	logger.Infof("🔧 Initializing VAD pool... pool_size=%d", cfg.VAD.PoolSize)
-	if err := vadPool.Initialize(); err != nil {
-		logger.Errorf("Failed to initialize VAD pool: %v", err)
-		return nil, fmt.Errorf("failed to initialize VAD pool: %v", err)
+		if config.GlobalConfig.VAD.Provider == pool.SILERO_TYPE {
+			// 检查VAD模型文件是否存在（仅对silero需要）
+			if _, err := os.Stat(cfg.VAD.SileroVAD.ModelPath); os.IsNotExist(err) {
+				logger.Errorf("VAD model file not found, model_path=%s", cfg.VAD.SileroVAD.ModelPath)
+				return nil, fmt.Errorf("VAD model file not found: %s", cfg.VAD.SileroVAD.ModelPath)
+			}
+		}
+
+		// 使用工厂创建VAD池
+		vadPool, err = vadFactory.CreateVADPool()
+		if err != nil {
+			logger.Errorf("Failed to create VAD pool: %v", err)
+			return nil, fmt.Errorf("failed to create VAD pool: %v", err)
+		}
+
+		// 初始化VAD池
+		logger.Infof("🔧 Initializing VAD pool... pool_size=%d", cfg.VAD.PoolSize)
+		if err := vadPool.Initialize(); err != nil {
+			logger.Errorf("Failed to initialize VAD pool: %v", err)
+			return nil, fmt.Errorf("failed to initialize VAD pool: %v", err)
+		}
+	} else {
+		logger.Infof("⚠️  Recognition is disabled, skipping VAD and ASR initialization")
 	}
 
 	// 初始化会话管理器
@@ -149,6 +156,10 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 				Threshold:  cfg.Speaker.Threshold,
 				DataDir:    cfg.Speaker.DataDir,
 			}
+			// 设置 Qdrant 向量数据库配置
+			speakerConfig.VectorDB.Host = cfg.Speaker.VectorDB.Host
+			speakerConfig.VectorDB.Port = cfg.Speaker.VectorDB.Port
+			speakerConfig.VectorDB.CollectionName = cfg.Speaker.VectorDB.CollectionName
 			mgr, err := speaker.NewManager(speakerConfig)
 			if err == nil {
 				speakerManager = mgr

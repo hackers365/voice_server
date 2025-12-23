@@ -44,6 +44,17 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager *ses
 		conn.SetReadDeadline(time.Now().Add(time.Duration(wsConfig.ReadTimeout) * time.Second))
 	}
 
+	// 检查recognition是否启用，如果未启用则直接返回
+	if !config.GlobalConfig.Recognition.Enabled {
+		logger.Warnf("Recognition is disabled, closing WebSocket connection")
+		conn.WriteJSON(map[string]interface{}{
+			"type":    "error",
+			"message": "Recognition service is disabled",
+		})
+		conn.Close()
+		return
+	}
+
 	sessionID := GenerateSessionID()
 
 	// 创建会话

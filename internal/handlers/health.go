@@ -28,7 +28,7 @@ func HealthHandler(deps *bootstrap.AppDependencies) gin.HandlerFunc {
 			components["rate_limit"] = map[string]interface{}{"status": "not_initialized"}
 		}
 		if deps.SpeakerManager != nil {
-			components["speaker"] = deps.SpeakerManager.GetStats()
+			components["speaker"] = deps.SpeakerManager.GetStats("") // 传入空字符串获取全局统计
 		} else {
 			components["speaker"] = map[string]interface{}{"status": "disabled"}
 		}

@@ -25,6 +25,16 @@ docker build -t asr_server .
 docker run -d -p 8080:8080 --name asr_server asr_server
 ```
 
+#### 使用环境变量配置 Qdrant（可选）
+如果使用 Qdrant 向量数据库，可以通过环境变量配置连接信息（优先于配置文件）：
+```bash
+docker run -d -p 8080:8080 \
+  -e QDRANT_HOST=qdrant-server \
+  -e QDRANT_PORT=6334 \
+  -e QDRANT_COLLECTION_NAME=speaker_embeddings \
+  --name asr_server asr_server
+```
+
 #### 端口与访问
 - 测试页面: http://localhost:8080/
 - 健康检查: http://localhost:8080/health
@@ -85,7 +95,29 @@ go build -o asr_server
 ---
 
 ## ⚙️ 配置
+
+### 配置文件
 详细配置请参考 `config.json` 文件。
+
+### 环境变量配置（Docker 部署推荐）
+为了支持 Docker 部署，以下配置项优先从环境变量读取，如果环境变量不存在则使用配置文件的值：
+
+| 环境变量 | 说明 | 对应配置文件路径 | 默认值 |
+|---------|------|----------------|--------|
+| `QDRANT_HOST` | Qdrant 服务器地址 | `speaker.vector_db.host` | `localhost` |
+| `QDRANT_PORT` | Qdrant 服务器端口 | `speaker.vector_db.port` | `6334` |
+| `QDRANT_COLLECTION_NAME` | Qdrant 集合名称 | `speaker.vector_db.collection_name` | `speaker_embeddings` |
+
+**示例：**
+```bash
+# 使用环境变量配置 Qdrant
+export QDRANT_HOST=qdrant-server
+export QDRANT_PORT=6334
+export QDRANT_COLLECTION_NAME=speaker_embeddings
+
+# 运行服务
+./asr_server
+```
 
 ## 🔌 WebSocket API 示例
 ```javascript

@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"asr_server/config"
 	"asr_server/internal/config/hotreload"
@@ -156,10 +157,34 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 				Threshold:  cfg.Speaker.Threshold,
 				DataDir:    cfg.Speaker.DataDir,
 			}
-			// 设置 Qdrant 向量数据库配置
-			speakerConfig.VectorDB.Host = cfg.Speaker.VectorDB.Host
-			speakerConfig.VectorDB.Port = cfg.Speaker.VectorDB.Port
-			speakerConfig.VectorDB.CollectionName = cfg.Speaker.VectorDB.CollectionName
+			// 设置 Qdrant 向量数据库配置（优先从环境变量读取，其次从配置文件读取）
+			// 环境变量命名：QDRANT_HOST, QDRANT_PORT, QDRANT_COLLECTION_NAME
+			if envHost := os.Getenv("QDRANT_HOST"); envHost != "" {
+				speakerConfig.VectorDB.Host = envHost
+				logger.Infof("Using Qdrant host from environment variable: %s", envHost)
+			} else {
+				speakerConfig.VectorDB.Host = cfg.Speaker.VectorDB.Host
+			}
+
+			if envPort := os.Getenv("QDRANT_PORT"); envPort != "" {
+				if port, err := strconv.Atoi(envPort); err == nil {
+					speakerConfig.VectorDB.Port = port
+					logger.Infof("Using Qdrant port from environment variable: %d", port)
+				} else {
+					logger.Warnf("Invalid QDRANT_PORT environment variable: %s, using config file value", envPort)
+					speakerConfig.VectorDB.Port = cfg.Speaker.VectorDB.Port
+				}
+			} else {
+				speakerConfig.VectorDB.Port = cfg.Speaker.VectorDB.Port
+			}
+
+			if envCollectionName := os.Getenv("QDRANT_COLLECTION_NAME"); envCollectionName != "" {
+				speakerConfig.VectorDB.CollectionName = envCollectionName
+				logger.Infof("Using Qdrant collection name from environment variable: %s", envCollectionName)
+			} else {
+				speakerConfig.VectorDB.CollectionName = cfg.Speaker.VectorDB.CollectionName
+			}
+
 			mgr, err := speaker.NewManager(speakerConfig)
 			if err == nil {
 				speakerManager = mgr

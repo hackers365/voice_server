@@ -38,13 +38,15 @@ type Config struct {
 		Debug                       bool   `mapstructure:"debug"`
 	} `mapstructure:"recognition"`
 	Speaker struct {
-		Enabled    bool    `mapstructure:"enabled"`
-		ModelPath  string  `mapstructure:"model_path"`
-		NumThreads int     `mapstructure:"num_threads"`
-		Provider   string  `mapstructure:"provider"`
-		Threshold  float32 `mapstructure:"threshold"`
-		DataDir    string  `mapstructure:"data_dir"`
-		VectorDB   struct {
+		Enabled          bool    `mapstructure:"enabled"`
+		ModelPath        string  `mapstructure:"model_path"`
+		NumThreads       int     `mapstructure:"num_threads"`
+		Provider         string  `mapstructure:"provider"`
+		Threshold        float32 `mapstructure:"threshold"`
+		DataDir          string  `mapstructure:"data_dir"`
+		SaveAudioOnFinish bool   `mapstructure:"save_audio_on_finish"`
+		AudioSaveDir     string  `mapstructure:"audio_save_dir"`
+		VectorDB         struct {
 			Host           string `mapstructure:"host"`
 			Port           int    `mapstructure:"port"`
 			CollectionName string `mapstructure:"collection_name"`

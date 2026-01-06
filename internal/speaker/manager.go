@@ -6,7 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"asr_server/config"
 	"asr_server/internal/logger"
+	"asr_server/internal/pool"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
@@ -21,6 +23,9 @@ type Manager struct {
 	// Qdrant 向量数据库客户端（唯一存储）
 	vectorDB      *QdrantVectorDB
 	vectorDBMutex sync.RWMutex
+
+	// VAD池（用于过滤静音）
+	vadPool pool.VADPoolInterface
 }
 
 // Config 声纹识别配置
@@ -40,7 +45,7 @@ type Config struct {
 }
 
 // NewManager 创建声纹识别管理器
-func NewManager(config *Config) (*Manager, error) {
+func NewManager(config *Config, vadPool pool.VADPoolInterface) (*Manager, error) {
 	// 确保数据目录存在（用于其他用途，如临时文件）
 	if config.DataDir != "" {
 		if err := os.MkdirAll(config.DataDir, 0755); err != nil {
@@ -95,9 +100,10 @@ func NewManager(config *Config) (*Manager, error) {
 		embeddingDim: dim,
 		dataDir:      config.DataDir,
 		vectorDB:     vectorDB,
+		vadPool:      vadPool,
 	}
 
-	logger.Infof("✅ Speaker Manager initialized with Qdrant vector database")
+	logger.Infof("✅ Speaker Manager initialized with Qdrant vector database and VAD pool")
 	return manager, nil
 }
 
@@ -144,6 +150,181 @@ func (m *Manager) extractEmbedding(audioData []float32, sampleRate int) ([]float
 	return embedding, nil
 }
 
+// filterSilenceWithVAD 使用TEN-VAD过滤静音，仅保留语音段
+func (m *Manager) filterSilenceWithVAD(audioData []float32, sampleRate int) ([]float32, error) {
+	if m.vadPool == nil {
+		return audioData, nil
+	}
+
+	// 获取VAD实例
+	vadInstance, err := m.vadPool.Get()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get VAD instance: %v", err)
+	}
+	defer m.vadPool.Put(vadInstance)
+
+	// 类型断言，确保是TEN-VAD实例
+	tenVADInstance, ok := vadInstance.(*pool.TenVADInstance)
+	if !ok {
+		return nil, fmt.Errorf("VAD instance is not TEN-VAD type")
+	}
+
+	hopSize := config.GlobalConfig.VAD.TenVAD.HopSize
+	var filteredAudio []float32
+
+	// 分帧处理音频
+	for i := 0; i < len(audioData); i += hopSize {
+		end := i + hopSize
+		if end > len(audioData) {
+			end = len(audioData)
+		}
+		frame := audioData[i:end]
+
+		// 将float32转换为int16
+		int16Frame := make([]int16, len(frame))
+		for j, f := range frame {
+			// 限制范围在[-1.0, 1.0]，然后转换为int16
+			if f > 1.0 {
+				f = 1.0
+			} else if f < -1.0 {
+				f = -1.0
+			}
+			int16Frame[j] = int16(f * 32768)
+		}
+
+		// 调用VAD处理
+		_, flag, err := pool.GetInstance().ProcessAudio(tenVADInstance.Handle, int16Frame)
+		if err != nil {
+			return nil, fmt.Errorf("TEN-VAD ProcessAudio error: %v", err)
+		}
+
+		// flag == 1 表示语音，保留该帧；flag == 0 表示静音，丢弃
+		if flag == 1 {
+			filteredAudio = append(filteredAudio, frame...)
+		}
+	}
+
+	logger.Debugf("VAD filtering: original %d samples, filtered %d samples (removed %.2f%%)",
+		len(audioData), len(filteredAudio),
+		float64(len(audioData)-len(filteredAudio))/float64(len(audioData))*100)
+
+	return filteredAudio, nil
+}
+
+// filterSilenceWithVADKeepEdges 使用TEN-VAD过滤静音，保留前后100ms的静音
+func (m *Manager) filterSilenceWithVADKeepEdges(audioData []float32, sampleRate int) ([]float32, error) {
+	if m.vadPool == nil {
+		return audioData, nil
+	}
+
+	// 获取VAD实例
+	vadInstance, err := m.vadPool.Get()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get VAD instance: %v", err)
+	}
+	defer m.vadPool.Put(vadInstance)
+
+	// 类型断言，确保是TEN-VAD实例
+	tenVADInstance, ok := vadInstance.(*pool.TenVADInstance)
+	if !ok {
+		return nil, fmt.Errorf("VAD instance is not TEN-VAD type")
+	}
+
+	hopSize := config.GlobalConfig.VAD.TenVAD.HopSize
+	
+	// 计算100ms对应的采样点数
+	silenceSamples := int(float64(sampleRate) * 0.1) // 100ms = 0.1秒
+	
+	// 记录每帧的VAD结果和位置
+	type frameInfo struct {
+		startIdx int
+		endIdx   int
+		isSpeech bool
+	}
+	
+	var frames []frameInfo
+	
+	// 分帧处理音频，记录每帧的VAD结果
+	for i := 0; i < len(audioData); i += hopSize {
+		end := i + hopSize
+		if end > len(audioData) {
+			end = len(audioData)
+		}
+		frame := audioData[i:end]
+
+		// 将float32转换为int16
+		int16Frame := make([]int16, len(frame))
+		for j, f := range frame {
+			// 限制范围在[-1.0, 1.0]，然后转换为int16
+			if f > 1.0 {
+				f = 1.0
+			} else if f < -1.0 {
+				f = -1.0
+			}
+			int16Frame[j] = int16(f * 32768)
+		}
+
+		// 调用VAD处理
+		_, flag, err := pool.GetInstance().ProcessAudio(tenVADInstance.Handle, int16Frame)
+		if err != nil {
+			return nil, fmt.Errorf("TEN-VAD ProcessAudio error: %v", err)
+		}
+
+		// flag == 1 表示语音，flag == 0 表示静音
+		frames = append(frames, frameInfo{
+			startIdx: i,
+			endIdx:   end,
+			isSpeech: flag == 1,
+		})
+	}
+
+	// 找到第一个和最后一个语音帧的位置
+	firstSpeechIdx := -1
+	lastSpeechIdx := -1
+	for i, frame := range frames {
+		if frame.isSpeech {
+			if firstSpeechIdx == -1 {
+				firstSpeechIdx = i
+			}
+			lastSpeechIdx = i
+		}
+	}
+
+	// 如果没有找到语音帧，返回空
+	if firstSpeechIdx == -1 {
+		logger.Debugf("VAD filtering: no speech detected, returning empty audio")
+		return []float32{}, nil
+	}
+
+	// 计算保留的起始和结束位置
+	// 第一个语音帧的起始位置减去100ms
+	startIdx := frames[firstSpeechIdx].startIdx - silenceSamples
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	// 最后一个语音帧的结束位置加上100ms
+	endIdx := frames[lastSpeechIdx].endIdx + silenceSamples
+	if endIdx > len(audioData) {
+		endIdx = len(audioData)
+	}
+
+	// 提取保留的音频段
+	filteredAudio := audioData[startIdx:endIdx]
+
+	logger.Debugf("VAD filtering with edges: original %d samples, filtered %d samples (kept %.2f%%, first speech at %d, last speech at %d)",
+		len(audioData), len(filteredAudio),
+		float64(len(filteredAudio))/float64(len(audioData))*100,
+		frames[firstSpeechIdx].startIdx, frames[lastSpeechIdx].endIdx)
+
+	return filteredAudio, nil
+}
+
+// FilterSilenceWithVADKeepEdges 使用TEN-VAD过滤静音，保留前后100ms的静音（公开方法）
+func (m *Manager) FilterSilenceWithVADKeepEdges(audioData []float32, sampleRate int) ([]float32, error) {
+	return m.filterSilenceWithVADKeepEdges(audioData, sampleRate)
+}
+
 // ExtractEmbedding 从音频数据提取声纹特征（公开方法，供外部调用）
 func (m *Manager) ExtractEmbedding(audioData []float32, sampleRate int) ([]float32, error) {
 	return m.extractEmbedding(audioData, sampleRate)
@@ -154,12 +335,21 @@ func (m *Manager) GetEmbeddingDim() int {
 	return m.embeddingDim
 }
 
-// RegisterSpeaker 注册声纹（支持 UID 维度隔离）
-func (m *Manager) RegisterSpeaker(uid, speakerID, speakerName string, audioData []float32, sampleRate int) error {
+// RegisterSpeaker 注册声纹（支持 UID 和 Agent ID 维度隔离）
+func (m *Manager) RegisterSpeaker(uid, agentID, speakerID, speakerName, uuid string, audioData []float32, sampleRate int) error {
 	if uid == "" {
 		return fmt.Errorf("uid is required")
 	}
 
+	if agentID == "" {
+		return fmt.Errorf("agent_id is required")
+	}
+
+	if uuid == "" {
+		return fmt.Errorf("uuid is required")
+	}
+
+	// 注意：音频数据应该在调用此方法之前已经过滤过静音（保留前后100ms）
 	// 提取声纹特征
 	embedding, err := m.extractEmbedding(audioData, sampleRate)
 	if err != nil {
@@ -172,7 +362,7 @@ func (m *Manager) RegisterSpeaker(uid, speakerID, speakerName string, audioData 
 	}
 
 	// 查询该 speaker 已存在的样本数量（用于确定 sample_index）
-	sampleIndex, err := m.vectorDB.GetSpeakerSampleCount(uid, speakerID)
+	sampleIndex, err := m.vectorDB.GetSpeakerSampleCount(uid, agentID, speakerID)
 	if err != nil {
 		// 如果查询失败，可能是 speaker 不存在，从 0 开始
 		sampleIndex = 0
@@ -180,23 +370,23 @@ func (m *Manager) RegisterSpeaker(uid, speakerID, speakerName string, audioData 
 
 	// 插入到 Qdrant 向量数据库
 	now := time.Now().Unix()
-	err = m.vectorDB.Insert(uid, speakerID, speakerName, embedding, sampleIndex, now, now)
+	err = m.vectorDB.Insert(uid, agentID, speakerID, speakerName, uuid, embedding, sampleIndex, now, now)
 	if err != nil {
 		return fmt.Errorf("failed to insert to vector database: %v", err)
 	}
 
-	logger.Infof("Successfully registered speaker %s (%s) for uid %s, sample index: %d",
-		speakerID, speakerName, uid, sampleIndex)
+	logger.Infof("Successfully registered speaker %s (%s) for uid %s, agent_id %s, uuid %s, sample index: %d",
+		speakerID, speakerName, uid, agentID, uuid, sampleIndex)
 	return nil
 }
 
-// IdentifySpeaker 识别声纹（支持 UID 维度隔离）
+// IdentifySpeaker 识别声纹（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）
+// uid: 用户ID，如果为空字符串则不作为过滤条件
+// agentID: Agent ID，如果为空字符串则不作为过滤条件
+// speakerID: 说话人ID，如果为空字符串则不作为过滤条件
+// speakerName: 说话人名称，如果为空字符串则不作为过滤条件
 // threshold: 识别阈值，如果 <= 0 则使用默认阈值
-func (m *Manager) IdentifySpeaker(uid string, audioData []float32, sampleRate int, threshold ...float32) (*IdentifyResult, error) {
-	if uid == "" {
-		return nil, fmt.Errorf("uid is required")
-	}
-
+func (m *Manager) IdentifySpeaker(uid, agentID, speakerID, speakerName string, audioData []float32, sampleRate int, threshold ...float32) (*IdentifyResult, error) {
 	// 确定使用的阈值：如果传入了有效的阈值（> 0），使用传入的；否则使用默认阈值
 	useThreshold := m.threshold
 	if len(threshold) > 0 && threshold[0] > 0 {
@@ -209,8 +399,8 @@ func (m *Manager) IdentifySpeaker(uid string, audioData []float32, sampleRate in
 		return nil, fmt.Errorf("failed to extract embedding: %v", err)
 	}
 
-	// 在 Qdrant 向量数据库中搜索（按 UID 过滤，返回 top 1）
-	results, err := m.vectorDB.Search(uid, embedding, useThreshold, 1)
+	// 在 Qdrant 向量数据库中搜索（按可选的 UID、agent_id、speaker_id 和 speaker_name 过滤，返回 top 1）
+	results, err := m.vectorDB.SearchWithOptionalFilters(uid, agentID, speakerID, speakerName, embedding, useThreshold, 1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search in vector database: %v", err)
 	}
@@ -234,8 +424,8 @@ func (m *Manager) IdentifySpeaker(uid string, audioData []float32, sampleRate in
 	return result, nil
 }
 
-// VerifySpeaker 验证声纹（支持 UID 维度隔离）
-func (m *Manager) VerifySpeaker(uid, speakerID string, audioData []float32, sampleRate int) (*VerifyResult, error) {
+// VerifySpeaker 验证声纹（支持 UID 和 Agent ID 维度隔离）
+func (m *Manager) VerifySpeaker(uid, agentID, speakerID string, audioData []float32, sampleRate int) (*VerifyResult, error) {
 	if uid == "" {
 		return nil, fmt.Errorf("uid is required")
 	}
@@ -247,8 +437,8 @@ func (m *Manager) VerifySpeaker(uid, speakerID string, audioData []float32, samp
 	}
 
 	// 在 Qdrant 中搜索该 speaker 的所有样本
-	// Filter: uid = xxx AND speaker_id = xxx
-	results, err := m.vectorDB.SearchWithFilter(uid, speakerID, embedding, m.threshold, 1)
+	// Filter: uid = xxx AND agent_id = xxx AND speaker_id = xxx
+	results, err := m.vectorDB.SearchWithFilter(uid, agentID, speakerID, embedding, m.threshold, 1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search in vector database: %v", err)
 	}
@@ -262,7 +452,7 @@ func (m *Manager) VerifySpeaker(uid, speakerID string, audioData []float32, samp
 		speakerName = results[0].SpeakerName
 	} else {
 		// 如果未找到，尝试获取 speaker 信息（验证是否存在）
-		speakerInfo, err := m.vectorDB.GetSpeakerInfo(uid, speakerID)
+		speakerInfo, err := m.vectorDB.GetSpeakerInfo(uid, agentID, speakerID)
 		if err != nil {
 			return nil, fmt.Errorf("speaker %s not found", speakerID)
 		}
@@ -278,9 +468,9 @@ func (m *Manager) VerifySpeaker(uid, speakerID string, audioData []float32, samp
 	}, nil
 }
 
-// GetAllSpeakers 获取指定 UID 的所有注册的说话人
-func (m *Manager) GetAllSpeakers(uid string) []*SpeakerInfo {
-	speakers, err := m.vectorDB.GetAllSpeakers(uid)
+// GetAllSpeakers 获取指定 UID 和 Agent ID 的所有注册的说话人
+func (m *Manager) GetAllSpeakers(uid, agentID string) []*SpeakerInfo {
+	speakers, err := m.vectorDB.GetAllSpeakers(uid, agentID)
 	if err != nil {
 		logger.Errorf("Failed to get speakers from vector database: %v", err)
 		return []*SpeakerInfo{}
@@ -288,25 +478,45 @@ func (m *Manager) GetAllSpeakers(uid string) []*SpeakerInfo {
 	return speakers
 }
 
-// DeleteSpeaker 删除说话人（支持 UID 维度隔离）
-func (m *Manager) DeleteSpeaker(uid, speakerID string) error {
+// DeleteSpeaker 删除说话人（支持 UID 和 Agent ID 维度隔离）
+func (m *Manager) DeleteSpeaker(uid, agentID, speakerID string) error {
 	if uid == "" {
 		return fmt.Errorf("uid is required")
 	}
 
 	// 从 Qdrant 向量数据库删除
-	err := m.vectorDB.DeleteSpeaker(uid, speakerID)
+	err := m.vectorDB.DeleteSpeaker(uid, agentID, speakerID)
 	if err != nil {
 		return fmt.Errorf("failed to delete from vector database: %v", err)
 	}
 
-	logger.Infof("Successfully deleted speaker %s for uid %s", speakerID, uid)
+	logger.Infof("Successfully deleted speaker %s for uid %s, agent_id %s", speakerID, uid, agentID)
 	return nil
 }
 
-// GetStats 获取统计信息（用于主服务监控，支持按 UID 过滤）
-func (m *Manager) GetStats(uid string) map[string]interface{} {
-	stats := m.GetDatabaseStats(uid)
+// DeleteSpeakerByUUID 通过 UUID 删除说话人（支持 UID 和 Agent ID 维度隔离）
+func (m *Manager) DeleteSpeakerByUUID(uid, agentID, uuid string) error {
+	if uid == "" {
+		return fmt.Errorf("uid is required")
+	}
+
+	if uuid == "" {
+		return fmt.Errorf("uuid is required")
+	}
+
+	// 从 Qdrant 向量数据库删除
+	err := m.vectorDB.DeleteSpeakerByUUID(uid, agentID, uuid)
+	if err != nil {
+		return fmt.Errorf("failed to delete from vector database: %v", err)
+	}
+
+	logger.Infof("Successfully deleted speaker with uuid %s for uid %s, agent_id %s", uuid, uid, agentID)
+	return nil
+}
+
+// GetStats 获取统计信息（用于主服务监控，支持按 UID 和 Agent ID 过滤）
+func (m *Manager) GetStats(uid, agentID string) map[string]interface{} {
+	stats := m.GetDatabaseStats(uid, agentID)
 
 	return map[string]interface{}{
 		"speaker_count": stats.TotalSpeakers,
@@ -318,10 +528,10 @@ func (m *Manager) GetStats(uid string) map[string]interface{} {
 	}
 }
 
-// GetDatabaseStats 获取数据库统计信息（支持按 UID 过滤）
-func (m *Manager) GetDatabaseStats(uid string) *DatabaseStats {
+// GetDatabaseStats 获取数据库统计信息（支持按 UID 和 Agent ID 过滤）
+func (m *Manager) GetDatabaseStats(uid, agentID string) *DatabaseStats {
 	// 从向量数据库获取统计信息
-	speakers, err := m.vectorDB.GetAllSpeakers(uid)
+	speakers, err := m.vectorDB.GetAllSpeakers(uid, agentID)
 	if err != nil {
 		logger.Errorf("Failed to get speakers from vector database: %v", err)
 		return &DatabaseStats{
@@ -369,6 +579,8 @@ type VerifyResult struct {
 type SpeakerInfo struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
+	UUID        string    `json:"uuid"`
+	AgentID     string    `json:"agent_id"`
 	SampleCount int       `json:"sample_count"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
@@ -385,30 +597,40 @@ type DatabaseStats struct {
 
 // StreamingIdentifier 流式声纹识别器
 type StreamingIdentifier struct {
-	manager    *Manager
-	uid        string // 用户ID
-	stream     *sherpa.OnlineStream
-	sampleRate int
-	threshold  float32 // 识别阈值，如果 <= 0 则使用默认阈值
-	mutex      sync.Mutex
-	isFinished bool
+	manager     *Manager
+	uid         string // 用户ID，如果为空字符串则不作为过滤条件
+	agentID     string // Agent ID，如果为空字符串则不作为过滤条件
+	speakerID   string // 说话人ID，如果为空字符串则不作为过滤条件
+	speakerName string // 说话人名称，如果为空字符串则不作为过滤条件
+	stream      *sherpa.OnlineStream
+	sampleRate  int
+	threshold   float32 // 识别阈值，如果 <= 0 则使用默认阈值
+	mutex       sync.Mutex
+	isFinished  bool
 }
 
-// NewStreamingIdentifier 创建流式识别器（支持 UID 维度隔离）
+// NewStreamingIdentifier 创建流式识别器（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）
+// uid: 用户ID，如果为空字符串则不作为过滤条件
+// agentID: Agent ID，如果为空字符串则不作为过滤条件
+// speakerID: 说话人ID，如果为空字符串则不作为过滤条件
+// speakerName: 说话人名称，如果为空字符串则不作为过滤条件
 // threshold: 识别阈值，如果 <= 0 则使用默认阈值
-func (m *Manager) NewStreamingIdentifier(uid string, sampleRate int, threshold ...float32) *StreamingIdentifier {
+func (m *Manager) NewStreamingIdentifier(uid, agentID, speakerID, speakerName string, sampleRate int, threshold ...float32) *StreamingIdentifier {
 	stream := m.extractor.CreateStream()
 	useThreshold := m.threshold
 	if len(threshold) > 0 && threshold[0] > 0 {
 		useThreshold = threshold[0]
 	}
 	return &StreamingIdentifier{
-		manager:    m,
-		uid:        uid,
-		stream:     stream,
-		sampleRate: sampleRate,
-		threshold:  useThreshold,
-		isFinished: false,
+		manager:     m,
+		uid:         uid,
+		agentID:     agentID,
+		speakerID:   speakerID,
+		speakerName: speakerName,
+		stream:      stream,
+		sampleRate:  sampleRate,
+		threshold:   useThreshold,
+		isFinished:  false,
 	}
 }
 
@@ -466,12 +688,15 @@ func (si *StreamingIdentifier) FinishAndIdentify() (*IdentifyResult, error) {
 		useThreshold = si.threshold
 	}
 
-	// 在 Qdrant 向量数据库中搜索（按 UID 过滤，返回 top 1）
-	results, err := si.manager.vectorDB.Search(si.uid, embedding, useThreshold, 1)
+	// 在 Qdrant 向量数据库中搜索（按可选的 UID、agent_id、speaker_id 和 speaker_name 过滤，返回 top 1）
+	results, err := si.manager.vectorDB.SearchWithOptionalFilters(si.uid, si.agentID, si.speakerID, si.speakerName, embedding, useThreshold, 1)
 	if err != nil {
 		si.cleanup()
 		return nil, fmt.Errorf("failed to search in vector database: %v", err)
 	}
+
+	//记录下results
+	logger.Debugf("Search results: %+v", results)
 
 	result := &IdentifyResult{
 		Identified:  false,

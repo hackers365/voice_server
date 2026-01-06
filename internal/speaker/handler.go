@@ -9,10 +9,13 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-audio/audio"
 	"github.com/go-audio/wav"
 	"github.com/gorilla/websocket"
 )
@@ -57,6 +60,34 @@ func getUIDFromRequest(c *gin.Context) string {
 	return ""
 }
 
+// getAgentIDFromRequest 从请求中提取 Agent ID
+// 优先级：请求头 X-Agent-ID > 查询参数 agent_id > 表单字段 agent_id
+func getAgentIDFromRequest(c *gin.Context) string {
+	// 1. 从请求头获取
+	if agentID := c.GetHeader("X-Agent-ID"); agentID != "" {
+		return agentID
+	}
+
+	// 2. 从查询参数获取
+	if agentID := c.Query("agent_id"); agentID != "" {
+		return agentID
+	}
+
+	// 3. 从表单字段获取
+	if agentID := c.PostForm("agent_id"); agentID != "" {
+		return agentID
+	}
+
+	// 4. 从认证中间件获取（如果存在）
+	if agentID, exists := c.Get("agent_id"); exists {
+		if agentIDStr, ok := agentID.(string); ok && agentIDStr != "" {
+			return agentIDStr
+		}
+	}
+
+	return ""
+}
+
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(router *gin.Engine) {
 	speakerGroup := router.Group("/api/v1/speaker")
@@ -73,8 +104,8 @@ func (h *Handler) RegisterRoutes(router *gin.Engine) {
 		// 获取所有说话人
 		speakerGroup.GET("/list", h.GetAllSpeakers)
 
-		// 删除说话人
-		speakerGroup.DELETE("/:speaker_id", h.DeleteSpeaker)
+		// 删除说话人（支持两种方式：查询参数 uuid 或路径参数 speaker_id）
+		speakerGroup.DELETE("/:speaker_id", h.DeleteSpeaker) // 支持 DELETE /api/v1/speaker/:speaker_id
 
 		// 获取数据库统计信息
 		speakerGroup.GET("/stats", h.GetStats)
@@ -99,9 +130,19 @@ func (h *Handler) RegisterSpeaker(c *gin.Context) {
 		return
 	}
 
+	// 获取 Agent ID（必填）
+	agentID := getAgentIDFromRequest(c)
+	if agentID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "agent_id is required (X-Agent-ID header, agent_id query param, or agent_id form field)",
+		})
+		return
+	}
+
 	// 获取表单数据
 	speakerID := c.PostForm("speaker_id")
 	speakerName := c.PostForm("speaker_name")
+	uuid := c.PostForm("uuid") // 新增：UUID 参数
 
 	if speakerID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -113,6 +154,13 @@ func (h *Handler) RegisterSpeaker(c *gin.Context) {
 	if speakerName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "speaker_name is required",
+		})
+		return
+	}
+
+	if uuid == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "uuid is required",
 		})
 		return
 	}
@@ -136,8 +184,17 @@ func (h *Handler) RegisterSpeaker(c *gin.Context) {
 		return
 	}
 
-	// 注册声纹
-	err = h.manager.RegisterSpeaker(uid, speakerID, speakerName, audioData, sampleRate)
+	// 使用VAD过滤静音，保留前后100ms的静音
+	filteredAudio, err := h.manager.FilterSilenceWithVADKeepEdges(audioData, sampleRate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("failed to filter silence: %v", err),
+		})
+		return
+	}
+
+	// 注册声纹（使用过滤后的音频）
+	err = h.manager.RegisterSpeaker(uid, agentID, speakerID, speakerName, uuid, filteredAudio, sampleRate)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": fmt.Sprintf("failed to register speaker: %v", err),
@@ -145,23 +202,43 @@ func (h *Handler) RegisterSpeaker(c *gin.Context) {
 		return
 	}
 
+	// 保存音频文件（异步保存，不阻塞响应）
+	go func() {
+		if err := saveRegisterAudioToWAV(filteredAudio, sampleRate, uid, agentID); err != nil {
+			logger.Warnf("Failed to save register audio file: %v", err)
+		} else {
+			logger.Infof("Register audio file saved successfully, samples: %d", len(filteredAudio))
+		}
+	}()
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":      "Speaker registered successfully",
 		"uid":          uid,
+		"agent_id":     agentID,
 		"speaker_id":   speakerID,
 		"speaker_name": speakerName,
+		"uuid":         uuid,
 	})
 }
 
 // IdentifySpeaker 识别声纹
 func (h *Handler) IdentifySpeaker(c *gin.Context) {
-	// 获取 UID
+	// 获取 UID（可选）
 	uid := getUIDFromRequest(c)
-	if uid == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "uid is required (X-User-ID header, uid query param, or uid form field)",
-		})
-		return
+
+	// 获取 Agent ID（可选）
+	agentID := getAgentIDFromRequest(c)
+
+	// 获取 speaker_id 参数（可选）
+	speakerID := c.Query("speaker_id")
+	if speakerID == "" {
+		speakerID = c.PostForm("speaker_id")
+	}
+
+	// 获取 speaker_name 参数（可选）
+	speakerName := c.Query("speaker_name")
+	if speakerName == "" {
+		speakerName = c.PostForm("speaker_name")
 	}
 
 	// 获取音频文件
@@ -198,9 +275,9 @@ func (h *Handler) IdentifySpeaker(c *gin.Context) {
 	// 识别声纹（如果提供了阈值则使用，否则使用默认值）
 	var result *IdentifyResult
 	if threshold > 0 {
-		result, err = h.manager.IdentifySpeaker(uid, audioData, sampleRate, threshold)
+		result, err = h.manager.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioData, sampleRate, threshold)
 	} else {
-		result, err = h.manager.IdentifySpeaker(uid, audioData, sampleRate)
+		result, err = h.manager.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioData, sampleRate)
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -222,6 +299,9 @@ func (h *Handler) VerifySpeaker(c *gin.Context) {
 		})
 		return
 	}
+
+	// 获取 Agent ID（可选）
+	agentID := getAgentIDFromRequest(c)
 
 	speakerID := c.Param("speaker_id")
 	if speakerID == "" {
@@ -251,7 +331,7 @@ func (h *Handler) VerifySpeaker(c *gin.Context) {
 	}
 
 	// 验证声纹
-	result, err := h.manager.VerifySpeaker(uid, speakerID, audioData, sampleRate)
+	result, err := h.manager.VerifySpeaker(uid, agentID, speakerID, audioData, sampleRate)
 	if err != nil {
 		if strings.Contains(err.Error(), "belongs to different uid") {
 			c.JSON(http.StatusForbidden, gin.H{
@@ -279,15 +359,22 @@ func (h *Handler) GetAllSpeakers(c *gin.Context) {
 		return
 	}
 
-	speakers := h.manager.GetAllSpeakers(uid)
+	// 获取 Agent ID（可选）
+	agentID := getAgentIDFromRequest(c)
+
+	speakers := h.manager.GetAllSpeakers(uid, agentID)
 	c.JSON(http.StatusOK, gin.H{
 		"uid":      uid,
+		"agent_id": agentID,
 		"speakers": speakers,
 		"total":    len(speakers),
 	})
 }
 
 // DeleteSpeaker 删除说话人
+// 支持两种方式：
+// 1. 通过查询参数 uuid 删除：DELETE /api/v1/speaker?uuid=xxx
+// 2. 通过路径参数 speaker_id 删除：DELETE /api/v1/speaker/:speaker_id（用于删除整个声纹组）
 func (h *Handler) DeleteSpeaker(c *gin.Context) {
 	// 获取 UID
 	uid := getUIDFromRequest(c)
@@ -298,15 +385,52 @@ func (h *Handler) DeleteSpeaker(c *gin.Context) {
 		return
 	}
 
-	speakerID := c.Param("speaker_id")
-	if speakerID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "speaker_id is required",
+	// 获取 Agent ID（可选）
+	agentID := getAgentIDFromRequest(c)
+
+	// 优先使用 uuid 查询参数
+	uuid := c.Query("uuid")
+	if uuid != "" {
+		// 通过 UUID 删除
+		err := h.manager.DeleteSpeakerByUUID(uid, agentID, uuid)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				c.JSON(http.StatusNotFound, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			if strings.Contains(err.Error(), "belongs to different uid") {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error": err.Error(),
+				})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": fmt.Sprintf("failed to delete speaker: %v", err),
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":  "Speaker deleted successfully",
+			"uid":      uid,
+			"agent_id": agentID,
+			"uuid":     uuid,
 		})
 		return
 	}
 
-	err := h.manager.DeleteSpeaker(uid, speakerID)
+	// 通过路径参数 speaker_id 删除（speaker_id 就是组名称）
+	speakerID := c.Param("speaker_id")
+	if speakerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "uuid or speaker_id is required",
+		})
+		return
+	}
+
+	err := h.manager.DeleteSpeaker(uid, agentID, speakerID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			c.JSON(http.StatusNotFound, gin.H{
@@ -329,6 +453,7 @@ func (h *Handler) DeleteSpeaker(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message":    "Speaker deleted successfully",
 		"uid":        uid,
+		"agent_id":   agentID,
 		"speaker_id": speakerID,
 	})
 }
@@ -337,7 +462,9 @@ func (h *Handler) DeleteSpeaker(c *gin.Context) {
 func (h *Handler) GetStats(c *gin.Context) {
 	// UID 是可选的，如果不提供则返回全局统计
 	uid := getUIDFromRequest(c)
-	stats := h.manager.GetStats(uid)
+	// Agent ID 是可选的
+	agentID := getAgentIDFromRequest(c)
+	stats := h.manager.GetStats(uid, agentID)
 	c.JSON(http.StatusOK, stats)
 }
 
@@ -481,21 +608,25 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 		}
 	}
 
-	// 获取 UID（从查询参数或请求头）
+	// 获取 UID（从查询参数或请求头，可选）
 	uid := getUIDFromRequest(c)
-	if uid == "" {
-		logger.Warnf("WebSocket: No uid provided, using empty uid")
-		// 可以选择返回错误或使用默认值
-		// 这里为了兼容性，允许空 UID，但会在识别时失败
-	}
+
+	// 获取 Agent ID（可选）
+	agentID := getAgentIDFromRequest(c)
+
+	// 获取 speaker_id 参数（可选）
+	speakerID := c.Query("speaker_id")
+
+	// 获取 speaker_name 参数（可选）
+	speakerName := c.Query("speaker_name")
 
 	// 创建流式识别器（如果提供了阈值则使用，否则使用默认值）
-	logger.Debugf("WebSocket: Creating streaming identifier for uid: %s, sample rate: %d Hz, threshold: %.4f", uid, sampleRate, threshold)
+	logger.Debugf("WebSocket: Creating streaming identifier for uid: %s, agent_id: %s, speaker_id: %s, speaker_name: %s, sample rate: %d Hz, threshold: %.4f", uid, agentID, speakerID, speakerName, sampleRate, threshold)
 	var identifier *StreamingIdentifier
 	if threshold > 0 {
-		identifier = h.manager.NewStreamingIdentifier(uid, sampleRate, threshold)
+		identifier = h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate, threshold)
 	} else {
-		identifier = h.manager.NewStreamingIdentifier(uid, sampleRate)
+		identifier = h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate)
 	}
 	defer identifier.Close()
 
@@ -517,6 +648,10 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 		return
 	}
 	logger.Debugf("WebSocket: Sent connection confirmation message: %+v", connectionMsg)
+
+	// 音频缓冲区（用于保存音频文件）
+	var audioBuffer []float32
+	saveAudioEnabled := config.GlobalConfig.Speaker.SaveAudioOnFinish
 
 	// 读取消息
 	totalAudioSamples := 0
@@ -576,8 +711,22 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 						})
 						return
 					}
-					logger.Debugf("WebSocket: Identification result: identified=%v, speaker_id=%s, confidence=%.4f, threshold=%.4f",
-						result.Identified, result.SpeakerID, result.Confidence, result.Threshold)
+
+					// 如果启用了保存音频，保存音频文件
+					if saveAudioEnabled && len(audioBuffer) > 0 {
+						// 复制音频数据，避免在异步执行时数据被修改
+						audioDataCopy := make([]float32, len(audioBuffer))
+						copy(audioDataCopy, audioBuffer)
+						go func() {
+							// 异步保存，不阻塞响应
+							if err := saveAudioToWAV(audioDataCopy, sampleRate, uid, agentID); err != nil {
+								logger.Warnf("WebSocket: Failed to save audio file: %v", err)
+							} else {
+								logger.Infof("WebSocket: Audio file saved successfully, samples: %d", len(audioDataCopy))
+							}
+						}()
+					}
+
 					conn.WriteJSON(map[string]interface{}{
 						"type":   "result",
 						"result": result,
@@ -642,6 +791,11 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 				return
 			}
 
+			// 如果启用了保存音频，将数据追加到缓冲区
+			if saveAudioEnabled {
+				audioBuffer = append(audioBuffer, audioData...)
+			}
+
 			totalAudioSamples += sampleCount
 			audioChunkCount++
 
@@ -681,4 +835,190 @@ func parseFloat32(s string) (float32, error) {
 	var result float32
 	_, err := fmt.Sscanf(s, "%f", &result)
 	return result, err
+}
+
+// saveAudioToWAV 将音频数据保存为 WAV 文件
+func saveAudioToWAV(audioData []float32, sampleRate int, uid, agentID string) error {
+	if len(audioData) == 0 {
+		return fmt.Errorf("audio data is empty")
+	}
+
+	// 确定保存目录
+	saveDir := config.GlobalConfig.Speaker.AudioSaveDir
+	if saveDir == "" {
+		// 如果未指定，使用 data_dir
+		saveDir = config.GlobalConfig.Speaker.DataDir
+	}
+	if saveDir == "" {
+		saveDir = "data/speaker"
+	}
+
+	// 创建保存目录（如果不存在）
+	if err := os.MkdirAll(saveDir, 0755); err != nil {
+		return fmt.Errorf("failed to create save directory: %w", err)
+	}
+
+	// 生成文件名：时间戳_uid_agentid.wav
+	timestamp := time.Now().Format("20060102_150405")
+	var filename string
+	if uid != "" && agentID != "" {
+		filename = fmt.Sprintf("%s_%s_%s.wav", timestamp, uid, agentID)
+	} else if uid != "" {
+		filename = fmt.Sprintf("%s_%s.wav", timestamp, uid)
+	} else if agentID != "" {
+		filename = fmt.Sprintf("%s_%s.wav", timestamp, agentID)
+	} else {
+		filename = fmt.Sprintf("%s.wav", timestamp)
+	}
+
+	// 清理文件名中的非法字符
+	filename = strings.ReplaceAll(filename, "/", "_")
+	filename = strings.ReplaceAll(filename, "\\", "_")
+	filename = strings.ReplaceAll(filename, ":", "_")
+
+	filePath := filepath.Join(saveDir, filename)
+
+	// 创建文件
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	// 将 float32 转换为 int16
+	// float32 范围是 [-1.0, 1.0]，需要转换为 int16 范围 [-32768, 32767]
+	int16Data := make([]int, len(audioData))
+	normalizeFactor := config.GlobalConfig.Audio.NormalizeFactor
+	for i, sample := range audioData {
+		// 限制范围到 [-1.0, 1.0]
+		if sample > 1.0 {
+			sample = 1.0
+		} else if sample < -1.0 {
+			sample = -1.0
+		}
+		// 转换为 int16
+		int16Data[i] = int(sample * normalizeFactor)
+	}
+
+	// 创建音频格式
+	format := &audio.Format{
+		NumChannels: 1, // 单声道
+		SampleRate:  sampleRate,
+	}
+
+	// 创建 WAV 编码器
+	encoder := wav.NewEncoder(file, format.SampleRate, 16, format.NumChannels, 1)
+
+	// 创建音频缓冲区
+	buf := &audio.IntBuffer{
+		Format:         format,
+		SourceBitDepth: 16,
+		Data:           int16Data,
+	}
+
+	// 写入音频数据
+	if err := encoder.Write(buf); err != nil {
+		return fmt.Errorf("failed to write audio data: %w", err)
+	}
+
+	// 关闭编码器
+	if err := encoder.Close(); err != nil {
+		return fmt.Errorf("failed to close encoder: %w", err)
+	}
+
+	logger.Debugf("Saved audio file: %s, samples: %d, duration: %.2fs", filePath, len(audioData), float64(len(audioData))/float64(sampleRate))
+	return nil
+}
+
+// saveRegisterAudioToWAV 将注册音频数据保存为 WAV 文件（文件名加前缀 "register_"）
+func saveRegisterAudioToWAV(audioData []float32, sampleRate int, uid, agentID string) error {
+	if len(audioData) == 0 {
+		return fmt.Errorf("audio data is empty")
+	}
+
+	// 确定保存目录
+	saveDir := config.GlobalConfig.Speaker.AudioSaveDir
+	if saveDir == "" {
+		// 如果未指定，使用 data_dir
+		saveDir = config.GlobalConfig.Speaker.DataDir
+	}
+	if saveDir == "" {
+		saveDir = "data/speaker"
+	}
+
+	// 创建保存目录（如果不存在）
+	if err := os.MkdirAll(saveDir, 0755); err != nil {
+		return fmt.Errorf("failed to create save directory: %w", err)
+	}
+
+	// 生成文件名：register_时间戳_uid_agentid.wav
+	timestamp := time.Now().Format("20060102_150405")
+	var filename string
+	if uid != "" && agentID != "" {
+		filename = fmt.Sprintf("register_%s_%s_%s.wav", timestamp, uid, agentID)
+	} else if uid != "" {
+		filename = fmt.Sprintf("register_%s_%s.wav", timestamp, uid)
+	} else if agentID != "" {
+		filename = fmt.Sprintf("register_%s_%s.wav", timestamp, agentID)
+	} else {
+		filename = fmt.Sprintf("register_%s.wav", timestamp)
+	}
+
+	// 清理文件名中的非法字符
+	filename = strings.ReplaceAll(filename, "/", "_")
+	filename = strings.ReplaceAll(filename, "\\", "_")
+	filename = strings.ReplaceAll(filename, ":", "_")
+
+	filePath := filepath.Join(saveDir, filename)
+
+	// 创建文件
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	// 将 float32 转换为 int16
+	// float32 范围是 [-1.0, 1.0]，需要转换为 int16 范围 [-32768, 32767]
+	int16Data := make([]int, len(audioData))
+	normalizeFactor := config.GlobalConfig.Audio.NormalizeFactor
+	for i, sample := range audioData {
+		// 限制范围到 [-1.0, 1.0]
+		if sample > 1.0 {
+			sample = 1.0
+		} else if sample < -1.0 {
+			sample = -1.0
+		}
+		// 转换为 int16
+		int16Data[i] = int(sample * normalizeFactor)
+	}
+
+	// 创建音频格式
+	format := &audio.Format{
+		NumChannels: 1, // 单声道
+		SampleRate:  sampleRate,
+	}
+
+	// 创建 WAV 编码器
+	encoder := wav.NewEncoder(file, format.SampleRate, 16, format.NumChannels, 1)
+
+	// 创建音频缓冲区
+	buf := &audio.IntBuffer{
+		Format:         format,
+		SourceBitDepth: 16,
+		Data:           int16Data,
+	}
+
+	// 写入音频数据
+	if err := encoder.Write(buf); err != nil {
+		return fmt.Errorf("failed to write audio data: %w", err)
+	}
+
+	// 关闭编码器
+	if err := encoder.Close(); err != nil {
+		return fmt.Errorf("failed to close encoder: %w", err)
+	}
+
+	logger.Debugf("Saved register audio file: %s, samples: %d, duration: %.2fs", filePath, len(audioData), float64(len(audioData))/float64(sampleRate))
+	return nil
 }

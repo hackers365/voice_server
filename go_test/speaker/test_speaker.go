@@ -21,11 +21,12 @@ import (
 )
 
 const (
-	baseURL     = "http://192.168.208.214:8080"
-	speakerAPI  = baseURL + "/api/v1/speaker"
-	speakerID   = "test_speaker_001"
-	speakerName = "测试说话人"
-	defaultUID  = "test_user_001"
+	baseURL        = "http://192.168.208.214:8080"
+	speakerAPI     = baseURL + "/api/v1/speaker"
+	speakerID      = "test_speaker_001"
+	speakerName    = "测试说话人"
+	defaultUID     = "test_user_001"
+	defaultAgentID = ""
 )
 
 // IdentifyResult 识别结果结构
@@ -82,6 +83,9 @@ func main() {
 	var customSpeakerID string
 	var customSpeakerName string
 	var customUID string
+	var customAgentID string
+	var maxFrames int
+	var threshold float64
 
 	flag.StringVar(&registerFile, "register", "", "注册声纹的音频文件路径（WAV格式）")
 	flag.StringVar(&identifyFile, "identify", "", "识别声纹的音频文件路径（WAV格式）")
@@ -90,6 +94,9 @@ func main() {
 	flag.StringVar(&customSpeakerID, "speaker-id", speakerID, "说话人ID（默认：test_speaker_001）")
 	flag.StringVar(&customSpeakerName, "speaker-name", speakerName, "说话人名称（默认：测试说话人）")
 	flag.StringVar(&customUID, "uid", defaultUID, "用户ID（默认：test_user_001）")
+	flag.StringVar(&customAgentID, "agent-id", defaultAgentID, "代理ID（可选）")
+	flag.IntVar(&maxFrames, "frames", 0, "流式识别时发送的帧数（0表示发送所有帧，可选）")
+	flag.Float64Var(&threshold, "threshold", 0, "识别阈值（>0时使用，否则使用服务端默认值，可选）")
 	flag.Parse()
 
 	fmt.Println("========================================")
@@ -112,6 +119,9 @@ func main() {
 		fmt.Println("  -speaker-id <ID>        说话人ID（可选，默认：test_speaker_001）")
 		fmt.Println("  -speaker-name <名称>    说话人名称（可选，默认：测试说话人）")
 		fmt.Println("  -uid <用户ID>           用户ID（可选，默认：test_user_001）")
+		fmt.Println("  -agent-id <代理ID>      代理ID（可选）")
+		fmt.Println("  -frames <帧数>         流式识别时发送的帧数（0表示发送所有帧，可选）")
+		fmt.Println("  -threshold <阈值>      识别阈值（>0时使用，否则使用服务端默认值，可选）")
 		fmt.Println("\n示例:")
 		fmt.Println("  # 仅注册声纹")
 		fmt.Println("  go run test_speaker.go -register register.wav")
@@ -124,13 +134,21 @@ func main() {
 		fmt.Println("  # 注册并识别")
 		fmt.Println("  go run test_speaker.go -register register.wav -identify identify.wav")
 		fmt.Println("  go run test_speaker.go -register test.wav -identify test.wav -speaker-id user001 -uid user001")
+		fmt.Println("  # 流式识别时只发送前10帧")
+		fmt.Println("  go run test_speaker.go -identify test.wav -frames 10")
+		fmt.Println("  # 使用自定义阈值识别")
+		fmt.Println("  go run test_speaker.go -identify test.wav -threshold 0.7")
 		os.Exit(1)
 	}
 
 	// 处理列表查询
 	if listSpeakers {
-		fmt.Printf("\n步骤 1: 获取声纹列表 (用户ID: %s)...\n", customUID)
-		if err := listSpeakersFunc(customUID); err != nil {
+		fmt.Printf("\n步骤 1: 获取声纹列表 (用户ID: %s", customUID)
+		if customAgentID != "" {
+			fmt.Printf(", 代理ID: %s", customAgentID)
+		}
+		fmt.Println(")...")
+		if err := listSpeakersFunc(customUID, customAgentID); err != nil {
 			fmt.Printf("❌ 获取列表失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -146,8 +164,12 @@ func main() {
 		if listSpeakers {
 			stepNum = 2
 		}
-		fmt.Printf("\n步骤 %d: 删除声纹 (说话人ID: %s, 用户ID: %s)...\n", stepNum, deleteSpeakerID, customUID)
-		if err := deleteSpeaker(deleteSpeakerID, customUID); err != nil {
+		fmt.Printf("\n步骤 %d: 删除声纹 (说话人ID: %s, 用户ID: %s", stepNum, deleteSpeakerID, customUID)
+		if customAgentID != "" {
+			fmt.Printf(", 代理ID: %s", customAgentID)
+		}
+		fmt.Println(")...")
+		if err := deleteSpeaker(deleteSpeakerID, customUID, customAgentID); err != nil {
 			fmt.Printf("❌ 删除失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -183,7 +205,7 @@ func main() {
 
 		// 注册声纹
 		fmt.Printf("\n步骤 %d: 注册声纹 (使用文件: %s)...\n", stepNum, filepath.Base(registerPath))
-		if err := registerSpeaker(registerPath, customSpeakerID, customSpeakerName, customUID); err != nil {
+		if err := registerSpeaker(registerPath, customSpeakerID, customSpeakerName, customUID, customAgentID); err != nil {
 			fmt.Printf("❌ 注册失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -225,8 +247,12 @@ func main() {
 		}
 
 		// HTTP 识别声纹
-		fmt.Printf("\n步骤 %d: HTTP 识别声纹 (使用文件: %s)...\n", stepNum, filepath.Base(identifyPath))
-		result, err := identifySpeaker(identifyPath, customUID)
+		fmt.Printf("\n步骤 %d: HTTP 识别声纹 (使用文件: %s", stepNum, filepath.Base(identifyPath))
+		if threshold > 0 {
+			fmt.Printf(", 阈值: %.4f", threshold)
+		}
+		fmt.Println(")...")
+		result, err := identifySpeaker(identifyPath, customUID, customAgentID, threshold)
 		if err != nil {
 			fmt.Printf("❌ 识别失败: %v\n", err)
 			os.Exit(1)
@@ -253,8 +279,15 @@ func main() {
 
 		// WebSocket 流式识别
 		stepNum++
-		fmt.Printf("\n步骤 %d: WebSocket 流式识别 (使用文件: %s)...\n", stepNum, filepath.Base(identifyPath))
-		wsResult, err := identifySpeakerWebSocket(identifyPath, customUID)
+		fmt.Printf("\n步骤 %d: WebSocket 流式识别 (使用文件: %s", stepNum, filepath.Base(identifyPath))
+		if maxFrames > 0 {
+			fmt.Printf(", 发送前 %d 帧", maxFrames)
+		}
+		if threshold > 0 {
+			fmt.Printf(", 阈值: %.4f", threshold)
+		}
+		fmt.Println(")...")
+		wsResult, err := identifySpeakerWebSocket(identifyPath, customUID, customAgentID, maxFrames, threshold)
 		if err != nil {
 			fmt.Printf("❌ WebSocket 识别失败: %v\n", err)
 			os.Exit(1)
@@ -282,7 +315,7 @@ func main() {
 }
 
 // registerSpeaker 注册声纹
-func registerSpeaker(wavPath string, sid string, sname string, uid string) error {
+func registerSpeaker(wavPath string, sid string, sname string, uid string, agentID string) error {
 	// 打开文件
 	file, err := os.Open(wavPath)
 	if err != nil {
@@ -297,6 +330,12 @@ func registerSpeaker(wavPath string, sid string, sname string, uid string) error
 	// 添加表单字段
 	if err := writer.WriteField("uid", uid); err != nil {
 		return fmt.Errorf("写入 uid 失败: %v", err)
+	}
+
+	if agentID != "" {
+		if err := writer.WriteField("agent_id", agentID); err != nil {
+			return fmt.Errorf("写入 agent_id 失败: %v", err)
+		}
 	}
 
 	if err := writer.WriteField("speaker_id", sid); err != nil {
@@ -330,6 +369,9 @@ func registerSpeaker(wavPath string, sid string, sname string, uid string) error
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("X-User-ID", uid) // 同时通过请求头传递 uid
+	if agentID != "" {
+		req.Header.Set("X-Agent-ID", agentID) // 同时通过请求头传递 agent_id
+	}
 
 	// 发送请求
 	client := &http.Client{
@@ -371,7 +413,8 @@ func registerSpeaker(wavPath string, sid string, sname string, uid string) error
 }
 
 // identifySpeaker 识别声纹
-func identifySpeaker(wavPath string, uid string) (*IdentifyResult, error) {
+// threshold: 识别阈值，如果 <= 0 则使用服务端默认值
+func identifySpeaker(wavPath string, uid string, agentID string, threshold float64) (*IdentifyResult, error) {
 	// 打开文件
 	file, err := os.Open(wavPath)
 	if err != nil {
@@ -386,6 +429,20 @@ func identifySpeaker(wavPath string, uid string) (*IdentifyResult, error) {
 	// 添加表单字段 uid
 	if err := writer.WriteField("uid", uid); err != nil {
 		return nil, fmt.Errorf("写入 uid 失败: %v", err)
+	}
+
+	// 添加表单字段 agent_id（如果提供）
+	if agentID != "" {
+		if err := writer.WriteField("agent_id", agentID); err != nil {
+			return nil, fmt.Errorf("写入 agent_id 失败: %v", err)
+		}
+	}
+
+	// 添加表单字段 threshold（如果提供且 > 0）
+	if threshold > 0 {
+		if err := writer.WriteField("threshold", fmt.Sprintf("%.6f", threshold)); err != nil {
+			return nil, fmt.Errorf("写入 threshold 失败: %v", err)
+		}
 	}
 
 	// 添加文件
@@ -411,6 +468,9 @@ func identifySpeaker(wavPath string, uid string) (*IdentifyResult, error) {
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("X-User-ID", uid) // 同时通过请求头传递 uid
+	if agentID != "" {
+		req.Header.Set("X-Agent-ID", agentID) // 同时通过请求头传递 agent_id
+	}
 
 	// 发送请求
 	client := &http.Client{
@@ -519,7 +579,9 @@ func float32ToBytes(samples []float32) []byte {
 }
 
 // identifySpeakerWebSocket 通过WebSocket流式识别声纹
-func identifySpeakerWebSocket(wavPath string, uid string) (*IdentifyResult, error) {
+// maxFrames: 要发送的最大帧数，0表示发送所有帧
+// threshold: 识别阈值，如果 <= 0 则使用服务端默认值
+func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFrames int, threshold float64) (*IdentifyResult, error) {
 	// 读取WAV文件
 	audioData, sampleRate, err := readWavToFloat32(wavPath)
 	if err != nil {
@@ -534,10 +596,19 @@ func identifySpeakerWebSocket(wavPath string, uid string) (*IdentifyResult, erro
 	// 连接WebSocket，传入原始采样率和uid
 	// 服务端会根据传入的采样率自动重采样到模型期望的采样率（通常是16000Hz）
 	wsURL := fmt.Sprintf("ws://192.168.208.214:8080/api/v1/speaker/identify_ws?sample_rate=%d&uid=%s", sampleRate, uid)
+	if agentID != "" {
+		wsURL += fmt.Sprintf("&agent_id=%s", url.QueryEscape(agentID))
+	}
+	if threshold > 0 {
+		wsURL += fmt.Sprintf("&threshold=%.6f", threshold)
+	}
 
-	// 创建请求头，同时通过请求头传递 uid
+	// 创建请求头，同时通过请求头传递 uid 和 agent_id
 	header := http.Header{}
 	header.Set("X-User-ID", uid)
+	if agentID != "" {
+		header.Set("X-Agent-ID", agentID)
+	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
@@ -562,7 +633,14 @@ func identifySpeakerWebSocket(wavPath string, uid string) (*IdentifyResult, erro
 	chunkSize := sampleRate * 20 / 1000 // 20ms的样本数
 	totalChunks := (len(audioData) + chunkSize - 1) / chunkSize
 
-	fmt.Printf("   开始发送音频数据（分 %d 块，每块约 %d 样本）...\n", totalChunks, chunkSize)
+	// 如果指定了最大帧数，限制要发送的块数
+	chunksToSend := totalChunks
+	if maxFrames > 0 && maxFrames < totalChunks {
+		chunksToSend = maxFrames
+		fmt.Printf("   开始发送音频数据（发送前 %d/%d 块，每块约 %d 样本）...\n", chunksToSend, totalChunks, chunkSize)
+	} else {
+		fmt.Printf("   开始发送音频数据（分 %d 块，每块约 %d 样本）...\n", totalChunks, chunkSize)
+	}
 
 	// 启动goroutine接收消息
 	resultChan := make(chan *IdentifyResult, 1)
@@ -624,7 +702,14 @@ func identifySpeakerWebSocket(wavPath string, uid string) (*IdentifyResult, erro
 
 	// 发送音频数据块
 	totalSamplesSent := 0
+	currentChunk := 0
 	for i := 0; i < len(audioData); i += chunkSize {
+		// 如果指定了最大帧数，检查是否已达到限制（在发送前检查）
+		if maxFrames > 0 && currentChunk >= maxFrames {
+			fmt.Printf("   ⚠️  已达到最大帧数限制 (%d 帧)，停止发送\n", maxFrames)
+			break
+		}
+
 		end := i + chunkSize
 		if end > len(audioData) {
 			end = len(audioData)
@@ -633,13 +718,16 @@ func identifySpeakerWebSocket(wavPath string, uid string) (*IdentifyResult, erro
 		chunk := audioData[i:end]
 		chunkBytes := float32ToBytes(chunk)
 		totalSamplesSent += len(chunk)
+		currentChunk++
 
 		if err := conn.WriteMessage(websocket.BinaryMessage, chunkBytes); err != nil {
 			return nil, fmt.Errorf("发送音频数据失败: %v", err)
 		}
 
-		if (i/chunkSize+1)%10 == 0 || end == len(audioData) {
-			fmt.Printf("   已发送 %d/%d 块 (共 %d 样本)\n", (i/chunkSize)+1, totalChunks, totalSamplesSent)
+		// 显示发送进度
+		shouldPrint := currentChunk%10 == 0 || end == len(audioData) || (maxFrames > 0 && currentChunk >= maxFrames)
+		if shouldPrint {
+			fmt.Printf("   已发送 %d/%d 块 (共 %d 样本)\n", currentChunk, chunksToSend, totalSamplesSent)
 		}
 	}
 
@@ -696,7 +784,7 @@ func getFloat32(m map[string]interface{}, key string) float32 {
 }
 
 // listSpeakersFunc 获取声纹列表
-func listSpeakersFunc(uid string) error {
+func listSpeakersFunc(uid string, agentID string) error {
 	// 构建 URL，安全编码参数
 	apiURL, err := url.Parse(speakerAPI + "/list")
 	if err != nil {
@@ -704,6 +792,9 @@ func listSpeakersFunc(uid string) error {
 	}
 	params := url.Values{}
 	params.Set("uid", uid)
+	if agentID != "" {
+		params.Set("agent_id", agentID)
+	}
 	apiURL.RawQuery = params.Encode()
 
 	// 创建 HTTP 请求
@@ -713,6 +804,9 @@ func listSpeakersFunc(uid string) error {
 	}
 
 	req.Header.Set("X-User-ID", uid) // 同时通过请求头传递 uid
+	if agentID != "" {
+		req.Header.Set("X-Agent-ID", agentID) // 同时通过请求头传递 agent_id
+	}
 
 	// 发送请求
 	client := &http.Client{
@@ -774,7 +868,7 @@ func listSpeakersFunc(uid string) error {
 }
 
 // deleteSpeaker 删除声纹
-func deleteSpeaker(speakerID string, uid string) error {
+func deleteSpeaker(speakerID string, uid string, agentID string) error {
 	// 构建 URL，安全编码路径参数
 	apiURL, err := url.Parse(speakerAPI)
 	if err != nil {
@@ -784,6 +878,9 @@ func deleteSpeaker(speakerID string, uid string) error {
 	apiURL.Path += "/" + url.PathEscape(speakerID)
 	params := url.Values{}
 	params.Set("uid", uid)
+	if agentID != "" {
+		params.Set("agent_id", agentID)
+	}
 	apiURL.RawQuery = params.Encode()
 
 	// 创建 HTTP DELETE 请求
@@ -793,6 +890,9 @@ func deleteSpeaker(speakerID string, uid string) error {
 	}
 
 	req.Header.Set("X-User-ID", uid) // 同时通过请求头传递 uid
+	if agentID != "" {
+		req.Header.Set("X-Agent-ID", agentID) // 同时通过请求头传递 agent_id
+	}
 
 	// 发送请求
 	client := &http.Client{

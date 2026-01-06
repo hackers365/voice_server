@@ -17,8 +17,8 @@
   },
   "vad": {
     "provider": "ten_vad",
-    "pool_size": 200,
-    "threshold": 0.5,
+    "pool_size": 20,
+    "threshold": 0.3,
     "silero_vad":{
       "model_path": "models/vad/silero_vad/silero_vad.onnx",
       "min_silence_duration": 0.1,
@@ -50,6 +50,8 @@
     "provider": "cpu",
     "threshold": 0.6,
     "data_dir": "data/speaker",
+    "save_audio_on_finish": false,
+    "audio_save_dir": "",
     "vector_db": {
       "host": "localhost",
       "port": 6334,
@@ -78,7 +80,7 @@
     "timeout": 6
   },
   "logging": {
-    "level": "info",
+    "level": "debug",
     "format": "text",
     "output": "both",
     "file_path": "logs/app.log",

@@ -56,21 +56,8 @@ func NewQdrantVectorDB(config *QdrantConfig, embeddingDim int) (*QdrantVectorDB,
 
 	// 确保 Collection 存在
 	ctx := context.Background()
-	_, err = client.GetCollectionInfo(ctx, config.CollectionName)
-	if err != nil {
-		// Collection 不存在，创建它
-		logger.Infof("Collection '%s' does not exist, creating it...", config.CollectionName)
-		err = client.CreateCollection(ctx, &qdrant.CreateCollection{
-			CollectionName: config.CollectionName,
-			VectorsConfig: qdrant.NewVectorsConfig(&qdrant.VectorParams{
-				Size:     uint64(embeddingDim),
-				Distance: qdrant.Distance_Cosine, // 使用余弦距离（Qdrant 自动归一化）
-			}),
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create collection: %v", err)
-		}
-		logger.Infof("✅ Collection '%s' created successfully", config.CollectionName)
+	if err := db.ensureCollectionExists(ctx); err != nil {
+		return nil, err
 	}
 
 	return db, nil
@@ -100,21 +87,47 @@ func normalizeVector(v []float32) []float32 {
 }
 
 // generatePointID 生成唯一的 Point ID
-func generatePointID(uid, speakerID string, sampleIndex int) uint64 {
+func generatePointID(uid, agentID, speakerID string, sampleIndex int) uint64 {
 	hash := fnv.New64a()
-	hash.Write([]byte(fmt.Sprintf("%s:%s:%d", uid, speakerID, sampleIndex)))
+	hash.Write([]byte(fmt.Sprintf("%s:%s:%s:%d", uid, agentID, speakerID, sampleIndex)))
 	return hash.Sum64()
 }
 
+// ensureCollectionExists 确保 Collection 存在，如果不存在则创建
+func (db *QdrantVectorDB) ensureCollectionExists(ctx context.Context) error {
+	_, err := db.client.GetCollectionInfo(ctx, db.collectionName)
+	if err != nil {
+		// Collection 不存在，创建它
+		logger.Infof("Collection '%s' does not exist, creating it...", db.collectionName)
+		err = db.client.CreateCollection(ctx, &qdrant.CreateCollection{
+			CollectionName: db.collectionName,
+			VectorsConfig: qdrant.NewVectorsConfig(&qdrant.VectorParams{
+				Size:     uint64(db.embeddingDim),
+				Distance: qdrant.Distance_Cosine, // 使用余弦距离（Qdrant 自动归一化）
+			}),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create collection: %v", err)
+		}
+		logger.Infof("✅ Collection '%s' created successfully", db.collectionName)
+	}
+	return nil
+}
+
 // Insert 插入 embedding 到向量数据库
-func (db *QdrantVectorDB) Insert(uid, speakerID, speakerName string, embedding []float32, sampleIndex int, createdAt, updatedAt int64) error {
+func (db *QdrantVectorDB) Insert(uid, agentID, speakerID, speakerName, uuid string, embedding []float32, sampleIndex int, createdAt, updatedAt int64) error {
 	ctx := context.Background()
+
+	// 确保 Collection 存在（如果不存在则创建）
+	if err := db.ensureCollectionExists(ctx); err != nil {
+		return fmt.Errorf("failed to ensure collection exists: %v", err)
+	}
 
 	// 注意：使用 Distance_Cosine 时，Qdrant 会自动对向量进行归一化
 	// 因此不需要在程序中手动归一化（即使传入的向量已经归一化，Qdrant 再次归一化也没问题）
 
 	// 生成唯一的 Point ID
-	pointID := generatePointID(uid, speakerID, sampleIndex)
+	pointID := generatePointID(uid, agentID, speakerID, sampleIndex)
 
 	// 构建 Point
 	point := &qdrant.PointStruct{
@@ -122,8 +135,10 @@ func (db *QdrantVectorDB) Insert(uid, speakerID, speakerName string, embedding [
 		Vectors: qdrant.NewVectors(embedding...),
 		Payload: qdrant.NewValueMap(map[string]any{
 			"uid":          uid,
+			"agent_id":     agentID,
 			"speaker_id":   speakerID,
 			"speaker_name": speakerName,
+			"uuid":         uuid,
 			"sample_index": sampleIndex,
 			"created_at":   createdAt,
 			"updated_at":   updatedAt,
@@ -143,13 +158,37 @@ func (db *QdrantVectorDB) Insert(uid, speakerID, speakerName string, embedding [
 
 // Search 搜索相似向量（按 UID 过滤）
 func (db *QdrantVectorDB) Search(uid string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error) {
+	return db.SearchWithOptionalFilters(uid, "", "", "", queryEmbedding, threshold, topK)
+}
+
+// SearchWithOptionalFilters 搜索相似向量（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）
+// uid: 用户ID，如果为空字符串则不作为过滤条件
+// agentID: Agent ID，如果为空字符串则不作为过滤条件
+// speakerID: 说话人ID，如果为空字符串则不作为过滤条件
+// speakerName: 说话人名称，如果为空字符串则不作为过滤条件
+func (db *QdrantVectorDB) SearchWithOptionalFilters(uid, agentID, speakerID, speakerName string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error) {
 	ctx := context.Background()
 
-	// 构建过滤条件（按 UID 过滤）
-	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("uid", uid),
-		},
+	// 构建过滤条件（按 UID、agent_id、speaker_id 和 speaker_name 过滤，如果为空则不添加该条件）
+	conditions := make([]*qdrant.Condition, 0)
+	if uid != "" {
+		conditions = append(conditions, qdrant.NewMatch("uid", uid))
+	}
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
+	if speakerID != "" {
+		conditions = append(conditions, qdrant.NewMatch("speaker_id", speakerID))
+	}
+	if speakerName != "" {
+		conditions = append(conditions, qdrant.NewMatch("speaker_name", speakerName))
+	}
+
+	var filter *qdrant.Filter
+	if len(conditions) > 0 {
+		filter = &qdrant.Filter{
+			Must: conditions,
+		}
 	}
 
 	limit := uint64(topK)
@@ -161,13 +200,29 @@ func (db *QdrantVectorDB) Search(uid string, queryEmbedding []float32, threshold
 	normalizedQueryEmbedding := normalizeVector(queryEmbedding)
 
 	// 使用 Query API 搜索
-	searchPoints, err := db.client.Query(ctx, &qdrant.QueryPoints{
+	queryPoints := &qdrant.QueryPoints{
 		CollectionName: db.collectionName,
 		Query:          qdrant.NewQuery(normalizedQueryEmbedding...),
-		Filter:         filter,
 		Limit:          &limit,
 		WithPayload:    qdrant.NewWithPayload(true),
-	})
+	}
+	if filter != nil {
+		queryPoints.Filter = filter
+	}
+
+	// 打印 queryPoints 信息
+	logger.Debugf("QueryPoints: CollectionName=%s, Limit=%d, WithPayload=%v, QueryEmbeddingLen=%d",
+		queryPoints.CollectionName, *queryPoints.Limit, queryPoints.WithPayload, len(normalizedQueryEmbedding))
+	if filter != nil {
+		logger.Debugf("  Filter: HasFilter=true, MustConditionsCount=%d", len(filter.Must))
+		for i, condition := range filter.Must {
+			logger.Debugf("    Filter.Must[%d]: %+v", i, condition)
+		}
+	} else {
+		logger.Debugf("  Filter: HasFilter=false")
+	}
+
+	searchPoints, err := db.client.Query(ctx, queryPoints)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %v", err)
 	}
@@ -229,16 +284,21 @@ func (db *QdrantVectorDB) Search(uid string, queryEmbedding []float32, threshold
 	return results, nil
 }
 
-// SearchWithFilter 搜索相似向量（按 UID 和 speaker_id 过滤）
-func (db *QdrantVectorDB) SearchWithFilter(uid, speakerID string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error) {
+// SearchWithFilter 搜索相似向量（按 UID、agent_id 和 speaker_id 过滤）
+func (db *QdrantVectorDB) SearchWithFilter(uid, agentID, speakerID string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error) {
 	ctx := context.Background()
 
-	// 构建过滤条件（按 UID 和 speaker_id 过滤）
+	// 构建过滤条件（按 UID、agent_id 和 speaker_id 过滤）
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+		qdrant.NewMatch("speaker_id", speakerID),
+	}
+	// 如果 agentID 不为空，则添加到过滤条件
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
 	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("uid", uid),
-			qdrant.NewMatch("speaker_id", speakerID),
-		},
+		Must: conditions,
 	}
 
 	limit := uint64(topK)
@@ -317,15 +377,20 @@ func (db *QdrantVectorDB) SearchWithFilter(uid, speakerID string, queryEmbedding
 }
 
 // GetSpeakerSampleCount 获取说话人的样本数量
-func (db *QdrantVectorDB) GetSpeakerSampleCount(uid, speakerID string) (int, error) {
+func (db *QdrantVectorDB) GetSpeakerSampleCount(uid, agentID, speakerID string) (int, error) {
 	ctx := context.Background()
 
 	// 使用 Scroll API 获取所有匹配的 points
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+		qdrant.NewMatch("speaker_id", speakerID),
+	}
+	// 如果 agentID 不为空，则添加到过滤条件
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
 	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("uid", uid),
-			qdrant.NewMatch("speaker_id", speakerID),
-		},
+		Must: conditions,
 	}
 
 	limit := uint32(10000) // 足够大的值
@@ -343,15 +408,20 @@ func (db *QdrantVectorDB) GetSpeakerSampleCount(uid, speakerID string) (int, err
 }
 
 // GetSpeakerInfo 获取说话人信息
-func (db *QdrantVectorDB) GetSpeakerInfo(uid, speakerID string) (*SpeakerInfo, error) {
+func (db *QdrantVectorDB) GetSpeakerInfo(uid, agentID, speakerID string) (*SpeakerInfo, error) {
 	ctx := context.Background()
 
 	// 使用 Scroll API 获取所有匹配的 points
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+		qdrant.NewMatch("speaker_id", speakerID),
+	}
+	// 如果 agentID 不为空，则添加到过滤条件
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
 	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("uid", uid),
-			qdrant.NewMatch("speaker_id", speakerID),
-		},
+		Must: conditions,
 	}
 
 	limit := uint32(10000)
@@ -413,15 +483,20 @@ func (db *QdrantVectorDB) GetSpeakerInfo(uid, speakerID string) (*SpeakerInfo, e
 	}, nil
 }
 
-// GetAllSpeakers 获取指定 UID 的所有说话人列表
-func (db *QdrantVectorDB) GetAllSpeakers(uid string) ([]*SpeakerInfo, error) {
+// GetAllSpeakers 获取指定 UID 和 Agent ID 的所有说话人列表
+func (db *QdrantVectorDB) GetAllSpeakers(uid, agentID string) ([]*SpeakerInfo, error) {
 	ctx := context.Background()
 
 	// 使用 Scroll API 获取所有匹配的 points
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+	}
+	// 如果 agentID 不为空，则添加到过滤条件
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
 	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("uid", uid),
-		},
+		Must: conditions,
 	}
 
 	limit := uint32(10000)
@@ -435,12 +510,14 @@ func (db *QdrantVectorDB) GetAllSpeakers(uid string) ([]*SpeakerInfo, error) {
 		return nil, fmt.Errorf("failed to scroll points: %v", err)
 	}
 
-	// 按 speaker_id 聚合
+	// 按 speaker_id 聚合（注意：根据新设计，每个样本使用不同的 speaker_id，所以这里实际上每个 speaker_id 只有一个样本）
 	speakerMap := make(map[string]*SpeakerInfo)
 	for _, point := range scrollResult {
 		payload := point.GetPayload()
 		var speakerID string
 		var speakerName string
+		var uuid string
+		var agentID string
 		var createdAt, updatedAt int64
 
 		if val, ok := payload["speaker_id"]; ok {
@@ -448,6 +525,12 @@ func (db *QdrantVectorDB) GetAllSpeakers(uid string) ([]*SpeakerInfo, error) {
 		}
 		if val, ok := payload["speaker_name"]; ok {
 			speakerName = val.GetStringValue()
+		}
+		if val, ok := payload["uuid"]; ok {
+			uuid = val.GetStringValue()
+		}
+		if val, ok := payload["agent_id"]; ok {
+			agentID = val.GetStringValue()
 		}
 		if val, ok := payload["created_at"]; ok {
 			createdAt = val.GetIntegerValue()
@@ -465,6 +548,8 @@ func (db *QdrantVectorDB) GetAllSpeakers(uid string) ([]*SpeakerInfo, error) {
 			info = &SpeakerInfo{
 				ID:          speakerID,
 				Name:        speakerName,
+				UUID:        uuid,
+				AgentID:     agentID,
 				SampleCount: 0,
 				CreatedAt:   time.Unix(createdAt, 0),
 				UpdatedAt:   time.Unix(updatedAt, 0),
@@ -498,16 +583,21 @@ func (db *QdrantVectorDB) GetAllSpeakers(uid string) ([]*SpeakerInfo, error) {
 	return speakers, nil
 }
 
-// DeleteSpeaker 删除说话人的所有向量
-func (db *QdrantVectorDB) DeleteSpeaker(uid, speakerID string) error {
+// DeleteSpeaker 删除说话人的所有向量（通过 speaker_id）
+func (db *QdrantVectorDB) DeleteSpeaker(uid, agentID, speakerID string) error {
 	ctx := context.Background()
 
 	// 使用 Scroll API 获取所有匹配的 points
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+		qdrant.NewMatch("speaker_id", speakerID),
+	}
+	// 如果 agentID 不为空，则添加到过滤条件
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
 	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("uid", uid),
-			qdrant.NewMatch("speaker_id", speakerID),
-		},
+		Must: conditions,
 	}
 
 	limit := uint32(10000)
@@ -523,6 +613,62 @@ func (db *QdrantVectorDB) DeleteSpeaker(uid, speakerID string) error {
 
 	if len(scrollResult) == 0 {
 		return nil // 没有数据需要删除
+	}
+
+	// 提取所有 Point IDs
+	ids := make([]*qdrant.PointId, 0, len(scrollResult))
+	for _, point := range scrollResult {
+		ids = append(ids, point.Id)
+	}
+
+	// 删除这些 points
+	_, err = db.client.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: db.collectionName,
+		Points: &qdrant.PointsSelector{
+			PointsSelectorOneOf: &qdrant.PointsSelector_Points{
+				Points: &qdrant.PointsIdsList{
+					Ids: ids,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete points: %v", err)
+	}
+
+	return nil
+}
+
+// DeleteSpeakerByUUID 通过 UUID 删除说话人的所有向量
+func (db *QdrantVectorDB) DeleteSpeakerByUUID(uid, agentID, uuid string) error {
+	ctx := context.Background()
+
+	// 使用 Scroll API 获取所有匹配的 points（按 uuid 过滤）
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+		qdrant.NewMatch("uuid", uuid),
+	}
+	// 如果 agentID 不为空，则添加到过滤条件
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
+	filter := &qdrant.Filter{
+		Must: conditions,
+	}
+
+	limit := uint32(10000)
+	scrollResult, err := db.client.Scroll(ctx, &qdrant.ScrollPoints{
+		CollectionName: db.collectionName,
+		Filter:         filter,
+		Limit:          &limit,
+		WithPayload:    qdrant.NewWithPayload(false), // 不需要 payload
+	})
+	if err != nil {
+		return fmt.Errorf("failed to scroll points: %v", err)
+	}
+
+	if len(scrollResult) == 0 {
+		return fmt.Errorf("speaker with uuid %s not found for uid %s", uuid, uid)
 	}
 
 	// 提取所有 Point IDs

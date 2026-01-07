@@ -1,9 +1,9 @@
 package router
 
 import (
-	"asr_server/internal/bootstrap"
-	"asr_server/internal/handlers"
-	"asr_server/internal/ws"
+	"voice_server/internal/bootstrap"
+	"voice_server/internal/handlers"
+	"voice_server/internal/ws"
 
 	"github.com/gin-gonic/gin"
 )

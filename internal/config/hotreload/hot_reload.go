@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"asr_server/config"
-	"asr_server/internal/logger"
+	"voice_server/config"
+	"voice_server/internal/logger"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"

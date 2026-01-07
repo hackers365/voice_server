@@ -3,8 +3,8 @@ package pool
 import (
 	"fmt"
 
-	"asr_server/config"
-	"asr_server/internal/logger"
+	"voice_server/config"
+	"voice_server/internal/logger"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )

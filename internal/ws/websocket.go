@@ -1,9 +1,9 @@
 package ws
 
 import (
-	"asr_server/config"
-	"asr_server/internal/logger"
-	"asr_server/internal/session"
+	"voice_server/config"
+	"voice_server/internal/logger"
+	"voice_server/internal/session"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"

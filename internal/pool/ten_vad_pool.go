@@ -8,7 +8,7 @@ import (
 	"time"
 	"unsafe"
 
-	"asr_server/internal/logger"
+	"voice_server/internal/logger"
 )
 
 // TenVADConfig TEN-VAD配置

@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY go.mod go.sum ./
 RUN go env -w GOPROXY=https://goproxy.cn,direct && go mod download
 COPY . .
-RUN go build -ldflags="-s -w" -o asr_server main.go
+RUN go build -ldflags="-s -w" -o voice_server main.go
 
 # 阶段2：模型下载
 FROM ubuntu:22.04 AS model-downloader
@@ -24,8 +24,8 @@ RUN mkdir -p models/vad/silero_vad \
     && mkdir -p models/asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17 \
     && mkdir -p models/speaker
 # 分步下载每个模型，便于排查
-RUN cd models && curl -L --retry 5 -o asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx
-RUN cd models && curl -L --retry 5 -o asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt
+#RUN cd models && curl -L --retry 5 -o asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx
+#RUN cd models && curl -L --retry 5 -o asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt
 RUN cd models && curl -L --retry 5 -o speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
 
 # 阶段3：最终运行时镜像
@@ -36,10 +36,10 @@ RUN echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe m
     && echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse" >> /etc/apt/sources.list \
     && echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse" >> /etc/apt/sources.list
 RUN apt-get update && apt-get install -y --no-install-recommends libc++1 libc++abi1
-COPY --from=builder /app/asr_server .
+COPY --from=builder /app/voice_server .
 COPY --from=model-downloader /app/models ./models
 # 直接复制本地的silero_vad模型文件
-COPY models/vad/silero_vad/silero_vad.onnx ./models/vad/silero_vad/
+#COPY models/vad/silero_vad/silero_vad.onnx ./models/vad/silero_vad/
 COPY config.json ./ 
 COPY static ./static
 COPY lib ./lib
@@ -47,4 +47,4 @@ ENV LD_LIBRARY_PATH=/app/lib:/app/lib/ten-vad/lib/Linux/x64
 RUN adduser --disabled-password --gecos "" appuser && chown -R appuser:appuser /app
 USER appuser
 EXPOSE 8080
-CMD ["./asr_server"]
+CMD ["./voice_server"]

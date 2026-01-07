@@ -1,4 +1,4 @@
-module asr_server
+module voice_server
 
 go 1.24.2
 

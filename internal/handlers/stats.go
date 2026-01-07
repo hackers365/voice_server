@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"asr_server/internal/bootstrap"
+	"voice_server/internal/bootstrap"
 	"time"
 
 	"github.com/gin-gonic/gin"

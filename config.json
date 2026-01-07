@@ -2,9 +2,9 @@
   "server": {
     "port": 8080,
     "host": "0.0.0.0",
-    "read_timeout": 20,
+    "read_timeout": 300,
     "websocket": {
-      "read_timeout": 20,
+      "read_timeout": 300,
       "max_message_size": 2097152,
       "read_buffer_size": 1024,
       "write_buffer_size": 1024,

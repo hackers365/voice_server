@@ -17,12 +17,12 @@
 
 #### 构建镜像
 ```bash
-docker build -t asr_server .
+docker build -t voice_server .
 ```
 
 #### 运行容器（假设端口 8080）
 ```bash
-docker run -d -p 8080:8080 --name asr_server asr_server
+docker run -d -p 8080:8080 --name voice_server voice_server
 ```
 
 #### 使用环境变量配置 Qdrant（可选）
@@ -32,7 +32,7 @@ docker run -d -p 8080:8080 \
   -e QDRANT_HOST=qdrant-server \
   -e QDRANT_PORT=6334 \
   -e QDRANT_COLLECTION_NAME=speaker_embeddings \
-  --name asr_server asr_server
+  --name voice_server voice_server
 ```
 
 #### 端口与访问
@@ -52,8 +52,8 @@ docker run -d -p 8080:8080 \
 #### 安装与依赖准备
 ```bash
 # 克隆项目
-git clone https://github.com/bbeyondllove/asr_server.git
-cd asr_server
+git clone https://github.com/bbeyondllove/voice_server.git
+cd voice_server
 # 安装Go依赖
 go mod tidy
 # 复制动态库到系统库目录（Linux）
@@ -83,8 +83,8 @@ wget -O models/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.on
 # 默认配置启动
 go run main.go
 # 或编译后运行
-go build -o asr_server
-./asr_server
+go build -o voice_server
+./voice_server
 ```
 
 #### 访问测试
@@ -116,7 +116,7 @@ export QDRANT_PORT=6334
 export QDRANT_COLLECTION_NAME=speaker_embeddings
 
 # 运行服务
-./asr_server
+./voice_server
 ```
 
 ## 🔌 WebSocket API 示例

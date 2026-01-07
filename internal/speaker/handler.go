@@ -1,8 +1,6 @@
 package speaker
 
 import (
-	"asr_server/config"
-	"asr_server/internal/logger"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"voice_server/config"
+	"voice_server/internal/logger"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-audio/audio"
@@ -573,6 +573,11 @@ var WebSocketUpgrader = websocket.Upgrader{
 }
 
 // IdentifySpeakerWebSocket WebSocket流式识别声纹
+// 支持连接复用和多轮次识别：
+// - 发送 {"action": "finish"} 完成当前轮次识别，返回结果后自动重置状态，准备下一轮
+// - 发送 {"action": "cancel"} 取消当前轮次识别，重置状态，准备下一轮
+// - 发送 {"action": "close"} 关闭连接
+// - 支持 WebSocket 协议层 ping/pong 心跳保活（自动回复 pong 并刷新超时计时器）
 func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 	// 升级为WebSocket连接
 	conn, err := WebSocketUpgrader.Upgrade(c.Writer, c.Request, nil)
@@ -582,7 +587,7 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 	}
 	defer conn.Close()
 
-	logger.Infof("WebSocket connection established for speaker identification")
+	logger.Infof("WebSocket connection established for speaker identification (multi-round enabled)")
 
 	// 获取采样率参数（默认16000）
 	sampleRate := 16000
@@ -620,15 +625,22 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 	// 获取 speaker_name 参数（可选）
 	speakerName := c.Query("speaker_name")
 
-	// 创建流式识别器（如果提供了阈值则使用，否则使用默认值）
-	logger.Debugf("WebSocket: Creating streaming identifier for uid: %s, agent_id: %s, speaker_id: %s, speaker_name: %s, sample rate: %d Hz, threshold: %.4f", uid, agentID, speakerID, speakerName, sampleRate, threshold)
-	var identifier *StreamingIdentifier
-	if threshold > 0 {
-		identifier = h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate, threshold)
-	} else {
-		identifier = h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate)
+	// 创建流式识别器的辅助函数
+	createIdentifier := func() *StreamingIdentifier {
+		logger.Debugf("WebSocket: Creating streaming identifier for uid: %s, agent_id: %s, speaker_id: %s, speaker_name: %s, sample rate: %d Hz, threshold: %.4f", uid, agentID, speakerID, speakerName, sampleRate, threshold)
+		if threshold > 0 {
+			return h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate, threshold)
+		}
+		return h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate)
 	}
-	defer identifier.Close()
+
+	// 创建初始流式识别器
+	identifier := createIdentifier()
+	defer func() {
+		if identifier != nil {
+			identifier.Close()
+		}
+	}()
 
 	// 设置读取超时
 	wsConfig := config.GlobalConfig.Server.WebSocket
@@ -637,10 +649,20 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 		logger.Debugf("WebSocket: Set read timeout: %d seconds", wsConfig.ReadTimeout)
 	}
 
+	// 设置 WebSocket 协议层 ping handler，收到 ping 时刷新超时并自动回复 pong
+	conn.SetPingHandler(func(appData string) error {
+		logger.Debugf("WebSocket: Received protocol ping, refreshing timeout and sending pong")
+		if wsConfig.ReadTimeout > 0 {
+			conn.SetReadDeadline(time.Now().Add(time.Duration(wsConfig.ReadTimeout) * time.Second))
+		}
+		// 回复 pong（使用相同的 appData）
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+	})
+
 	// 发送连接确认消息
 	connectionMsg := map[string]interface{}{
 		"type":        "connection",
-		"message":     "WebSocket connected, ready for audio",
+		"message":     "WebSocket connected, ready for audio (multi-round enabled)",
 		"sample_rate": sampleRate,
 	}
 	if err := conn.WriteJSON(connectionMsg); err != nil {
@@ -656,6 +678,7 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 	// 读取消息
 	totalAudioSamples := 0
 	audioChunkCount := 0
+	roundCount := 0 // 识别轮次计数
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
@@ -699,8 +722,9 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 				logger.Debugf("WebSocket: Control action: %s", action)
 				switch action {
 				case "finish":
-					// 完成识别
-					logger.Debugf("WebSocket: Finish action received, total audio samples: %d, chunks: %d", totalAudioSamples, audioChunkCount)
+					// 完成当前轮次识别
+					roundCount++
+					logger.Debugf("WebSocket: Finish action received (round %d), total audio samples: %d, chunks: %d", roundCount, totalAudioSamples, audioChunkCount)
 					logger.Debugf("WebSocket: Calling FinishAndIdentify()...")
 					result, err := identifier.FinishAndIdentify()
 					if err != nil {
@@ -708,8 +732,15 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 						conn.WriteJSON(map[string]interface{}{
 							"type":    "error",
 							"message": err.Error(),
+							"round":   roundCount,
 						})
-						return
+						// 重置状态，准备下一轮（即使出错也允许继续）
+						identifier.Close()
+						identifier = createIdentifier()
+						audioBuffer = nil
+						totalAudioSamples = 0
+						audioChunkCount = 0
+						continue
 					}
 
 					// 如果启用了保存音频，保存音频文件
@@ -717,26 +748,65 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 						// 复制音频数据，避免在异步执行时数据被修改
 						audioDataCopy := make([]float32, len(audioBuffer))
 						copy(audioDataCopy, audioBuffer)
+						currentRound := roundCount
 						go func() {
 							// 异步保存，不阻塞响应
 							if err := saveAudioToWAV(audioDataCopy, sampleRate, uid, agentID); err != nil {
-								logger.Warnf("WebSocket: Failed to save audio file: %v", err)
+								logger.Warnf("WebSocket: Failed to save audio file (round %d): %v", currentRound, err)
 							} else {
-								logger.Infof("WebSocket: Audio file saved successfully, samples: %d", len(audioDataCopy))
+								logger.Infof("WebSocket: Audio file saved successfully (round %d), samples: %d", currentRound, len(audioDataCopy))
 							}
 						}()
 					}
 
+					// 发送识别结果
 					conn.WriteJSON(map[string]interface{}{
 						"type":   "result",
 						"result": result,
+						"round":  roundCount,
 					})
-					logger.Infof("WebSocket: Sent identification result to client")
-					return
+					logger.Infof("WebSocket: Sent identification result to client (round %d)", roundCount)
+
+					// 重置状态，准备下一轮识别
+					identifier.Close()
+					identifier = createIdentifier()
+					audioBuffer = nil
+					totalAudioSamples = 0
+					audioChunkCount = 0
+
+					// 发送就绪消息，通知客户端可以开始下一轮
+					conn.WriteJSON(map[string]interface{}{
+						"type":    "ready",
+						"message": "Ready for next round",
+						"round":   roundCount + 1,
+					})
+					logger.Debugf("WebSocket: Reset state, ready for round %d", roundCount+1)
+
 				case "cancel":
-					// 取消识别
-					logger.Infof("WebSocket: Cancel action received, closing connection")
+					// 取消当前轮次识别，重置状态
+					logger.Infof("WebSocket: Cancel action received (round %d), resetting state", roundCount+1)
+					identifier.Close()
+					identifier = createIdentifier()
+					audioBuffer = nil
+					totalAudioSamples = 0
+					audioChunkCount = 0
+
+					conn.WriteJSON(map[string]interface{}{
+						"type":    "cancelled",
+						"message": "Current round cancelled, ready for next round",
+						"round":   roundCount + 1,
+					})
+
+				case "close":
+					// 显式关闭连接
+					logger.Infof("WebSocket: Close action received, closing connection after %d rounds", roundCount)
+					conn.WriteJSON(map[string]interface{}{
+						"type":         "closing",
+						"message":      "Connection closing",
+						"total_rounds": roundCount,
+					})
 					return
+
 				default:
 					logger.Warnf("WebSocket: Unknown action: %s", action)
 				}
@@ -819,8 +889,8 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 		}
 	}
 
-	logger.Infof("WebSocket: Connection closed, total audio chunks: %d, total samples: %d, total duration: %.2fs",
-		audioChunkCount, totalAudioSamples, float64(totalAudioSamples)/float64(sampleRate))
+	logger.Infof("WebSocket: Connection closed, total rounds: %d, current round audio chunks: %d, samples: %d, duration: %.2fs",
+		roundCount, audioChunkCount, totalAudioSamples, float64(totalAudioSamples)/float64(sampleRate))
 }
 
 // parseInt 解析整数（辅助函数）

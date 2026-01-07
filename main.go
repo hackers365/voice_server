@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"asr_server/config"
-	"asr_server/internal/bootstrap"
-	"asr_server/internal/logger"
-	"asr_server/internal/router"
+	"voice_server/config"
+	"voice_server/internal/bootstrap"
+	"voice_server/internal/logger"
+	"voice_server/internal/router"
 )
 
 func main() {

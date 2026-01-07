@@ -3,14 +3,15 @@ package bootstrap
 import (
 	"fmt"
 	"os"
+	"strconv"
 
-	"asr_server/config"
-	"asr_server/internal/config/hotreload"
-	"asr_server/internal/logger"
-	"asr_server/internal/middleware"
-	"asr_server/internal/pool"
-	"asr_server/internal/session"
-	"asr_server/internal/speaker"
+	"voice_server/config"
+	"voice_server/internal/config/hotreload"
+	"voice_server/internal/logger"
+	"voice_server/internal/middleware"
+	"voice_server/internal/pool"
+	"voice_server/internal/session"
+	"voice_server/internal/speaker"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
@@ -87,16 +88,21 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 		logger.Warnf("Failed to start config file watching, continuing without hot reload: %v", err)
 	}
 
-	// 初始化全局识别器
-	logger.Infof("🔧 Initializing global recognizer...")
-	globalRecognizer, err := createRecognizer(cfg)
-	if err != nil {
-		logger.Errorf("Failed to initialize global recognizer: %v", err)
-		return nil, fmt.Errorf("failed to initialize global recognizer: %v", err)
+	// 初始化全局识别器（仅在recognition启用时初始化）
+	var globalRecognizer *sherpa.OfflineRecognizer
+	if cfg.Recognition.Enabled {
+		// 初始化全局识别器
+		logger.Infof("🔧 Initializing global recognizer...")
+		globalRecognizer, err = createRecognizer(cfg)
+		if err != nil {
+			logger.Errorf("Failed to initialize global recognizer: %v", err)
+			return nil, fmt.Errorf("failed to initialize global recognizer: %v", err)
+		}
 	}
 
-	// 根据VAD类型初始化VAD池
+	// 初始化VAD池（总是初始化，不依赖recognition.enabled）
 	var vadPool pool.VADPoolInterface
+	logger.Infof("🔧 Initializing VAD pool...")
 	vadFactory := pool.NewVADFactory()
 
 	if config.GlobalConfig.VAD.Provider == pool.SILERO_TYPE {
@@ -149,7 +155,35 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 				Threshold:  cfg.Speaker.Threshold,
 				DataDir:    cfg.Speaker.DataDir,
 			}
-			mgr, err := speaker.NewManager(speakerConfig)
+			// 设置 Qdrant 向量数据库配置（优先从环境变量读取，其次从配置文件读取）
+			// 环境变量命名：QDRANT_HOST, QDRANT_PORT, QDRANT_COLLECTION_NAME
+			if envHost := os.Getenv("QDRANT_HOST"); envHost != "" {
+				speakerConfig.VectorDB.Host = envHost
+				logger.Infof("Using Qdrant host from environment variable: %s", envHost)
+			} else {
+				speakerConfig.VectorDB.Host = cfg.Speaker.VectorDB.Host
+			}
+
+			if envPort := os.Getenv("QDRANT_PORT"); envPort != "" {
+				if port, err := strconv.Atoi(envPort); err == nil {
+					speakerConfig.VectorDB.Port = port
+					logger.Infof("Using Qdrant port from environment variable: %d", port)
+				} else {
+					logger.Warnf("Invalid QDRANT_PORT environment variable: %s, using config file value", envPort)
+					speakerConfig.VectorDB.Port = cfg.Speaker.VectorDB.Port
+				}
+			} else {
+				speakerConfig.VectorDB.Port = cfg.Speaker.VectorDB.Port
+			}
+
+			if envCollectionName := os.Getenv("QDRANT_COLLECTION_NAME"); envCollectionName != "" {
+				speakerConfig.VectorDB.CollectionName = envCollectionName
+				logger.Infof("Using Qdrant collection name from environment variable: %s", envCollectionName)
+			} else {
+				speakerConfig.VectorDB.CollectionName = cfg.Speaker.VectorDB.CollectionName
+			}
+
+			mgr, err := speaker.NewManager(speakerConfig, vadPool)
 			if err == nil {
 				speakerManager = mgr
 				speakerHandler = speaker.NewHandler(speakerManager)

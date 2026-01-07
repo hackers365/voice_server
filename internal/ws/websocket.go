@@ -1,9 +1,9 @@
 package ws
 
 import (
-	"asr_server/config"
-	"asr_server/internal/logger"
-	"asr_server/internal/session"
+	"voice_server/config"
+	"voice_server/internal/logger"
+	"voice_server/internal/session"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
@@ -42,6 +42,17 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager *ses
 
 	if wsConfig.ReadTimeout > 0 {
 		conn.SetReadDeadline(time.Now().Add(time.Duration(wsConfig.ReadTimeout) * time.Second))
+	}
+
+	// 检查recognition是否启用，如果未启用则直接返回
+	if !config.GlobalConfig.Recognition.Enabled {
+		logger.Warnf("Recognition is disabled, closing WebSocket connection")
+		conn.WriteJSON(map[string]interface{}{
+			"type":    "error",
+			"message": "Recognition service is disabled",
+		})
+		conn.Close()
+		return
 	}
 
 	sessionID := GenerateSessionID()

@@ -7,7 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential
 COPY go.mod go.sum ./
 RUN go env -w GOPROXY=https://goproxy.cn,direct && go mod download
+# 先复制 lib 目录（包含 ten-vad 的头文件和库文件，cgo 编译时需要）
+COPY lib ./lib
 COPY . .
+# 设置 CGO 链接库路径
+ENV CGO_LDFLAGS="-L/app/lib/ten-vad/lib/Linux/x64"
+ENV CGO_CFLAGS="-I/app/lib/ten-vad/include"
 RUN go build -ldflags="-s -w" -o voice_server main.go
 
 # 阶段2：模型下载

@@ -21,12 +21,13 @@ import (
 )
 
 const (
-	baseURL        = "http://192.168.208.214:8080"
+	baseURL        = "http://192.168.209.138:9000"
 	speakerAPI     = baseURL + "/api/v1/speaker"
 	speakerID      = "test_speaker_001"
 	speakerName    = "测试说话人"
 	defaultUID     = "test_user_001"
-	defaultAgentID = ""
+	defaultAgentID = "test_agent_001"
+	defaultUUID    = "test_uuid_001"
 )
 
 // IdentifyResult 识别结果结构
@@ -84,6 +85,7 @@ func main() {
 	var customSpeakerName string
 	var customUID string
 	var customAgentID string
+	var customUUID string
 	var maxFrames int
 	var threshold float64
 
@@ -94,7 +96,8 @@ func main() {
 	flag.StringVar(&customSpeakerID, "speaker-id", speakerID, "说话人ID（默认：test_speaker_001）")
 	flag.StringVar(&customSpeakerName, "speaker-name", speakerName, "说话人名称（默认：测试说话人）")
 	flag.StringVar(&customUID, "uid", defaultUID, "用户ID（默认：test_user_001）")
-	flag.StringVar(&customAgentID, "agent-id", defaultAgentID, "代理ID（可选）")
+	flag.StringVar(&customAgentID, "agent-id", defaultAgentID, "代理ID（默认：test_agent_001，服务端必填）")
+	flag.StringVar(&customUUID, "uuid", defaultUUID, "注册会话UUID（默认：test_uuid_001，服务端必填）")
 	flag.IntVar(&maxFrames, "frames", 0, "流式识别时发送的帧数（0表示发送所有帧，可选）")
 	flag.Float64Var(&threshold, "threshold", 0, "识别阈值（>0时使用，否则使用服务端默认值，可选）")
 	flag.Parse()
@@ -119,7 +122,8 @@ func main() {
 		fmt.Println("  -speaker-id <ID>        说话人ID（可选，默认：test_speaker_001）")
 		fmt.Println("  -speaker-name <名称>    说话人名称（可选，默认：测试说话人）")
 		fmt.Println("  -uid <用户ID>           用户ID（可选，默认：test_user_001）")
-		fmt.Println("  -agent-id <代理ID>      代理ID（可选）")
+		fmt.Println("  -agent-id <代理ID>      代理ID（可选，默认：test_agent_001）")
+		fmt.Println("  -uuid <UUID>            注册会话UUID（可选，默认：test_uuid_001，注册时服务端必填）")
 		fmt.Println("  -frames <帧数>         流式识别时发送的帧数（0表示发送所有帧，可选）")
 		fmt.Println("  -threshold <阈值>      识别阈值（>0时使用，否则使用服务端默认值，可选）")
 		fmt.Println("\n示例:")
@@ -205,7 +209,7 @@ func main() {
 
 		// 注册声纹
 		fmt.Printf("\n步骤 %d: 注册声纹 (使用文件: %s)...\n", stepNum, filepath.Base(registerPath))
-		if err := registerSpeaker(registerPath, customSpeakerID, customSpeakerName, customUID, customAgentID); err != nil {
+		if err := registerSpeaker(registerPath, customSpeakerID, customSpeakerName, customUID, customAgentID, customUUID); err != nil {
 			fmt.Printf("❌ 注册失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -315,7 +319,7 @@ func main() {
 }
 
 // registerSpeaker 注册声纹
-func registerSpeaker(wavPath string, sid string, sname string, uid string, agentID string) error {
+func registerSpeaker(wavPath string, sid string, sname string, uid string, agentID string, uuid string) error {
 	// 打开文件
 	file, err := os.Open(wavPath)
 	if err != nil {
@@ -335,6 +339,12 @@ func registerSpeaker(wavPath string, sid string, sname string, uid string, agent
 	if agentID != "" {
 		if err := writer.WriteField("agent_id", agentID); err != nil {
 			return fmt.Errorf("写入 agent_id 失败: %v", err)
+		}
+	}
+
+	if uuid != "" {
+		if err := writer.WriteField("uuid", uuid); err != nil {
+			return fmt.Errorf("写入 uuid 失败: %v", err)
 		}
 	}
 

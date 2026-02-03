@@ -1,6 +1,6 @@
 {
   "server": {
-    "port": 8080,
+    "port": 9000,
     "host": "0.0.0.0",
     "read_timeout": 300,
     "websocket": {
@@ -52,8 +52,12 @@
     "data_dir": "data/speaker",
     "save_audio_on_finish": false,
     "audio_save_dir": "",
-    "vector_db": {
-      "host": "localhost",
+    "storage_type": "qdrant",
+    "json_storage": {
+      "file_path": "data/speaker/speaker_embeddings.json"
+    },
+    "qdrant": {
+      "host": "192.168.208.214",
       "port": 6334,
       "collection_name": "speaker_embeddings"
     }

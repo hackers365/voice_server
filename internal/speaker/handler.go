@@ -104,8 +104,9 @@ func (h *Handler) RegisterRoutes(router *gin.Engine) {
 		// 获取所有说话人
 		speakerGroup.GET("/list", h.GetAllSpeakers)
 
-		// 删除说话人（支持两种方式：查询参数 uuid 或路径参数 speaker_id）
-		speakerGroup.DELETE("/:speaker_id", h.DeleteSpeaker) // 支持 DELETE /api/v1/speaker/:speaker_id
+		// 删除说话人（支持两种方式）
+		speakerGroup.DELETE("", h.DeleteSpeaker)              // DELETE /api/v1/speaker?uuid=xxx
+		speakerGroup.DELETE("/:speaker_id", h.DeleteSpeaker)  // DELETE /api/v1/speaker/:speaker_id
 
 		// 获取数据库统计信息
 		speakerGroup.GET("/stats", h.GetStats)
@@ -372,9 +373,9 @@ func (h *Handler) GetAllSpeakers(c *gin.Context) {
 }
 
 // DeleteSpeaker 删除说话人
-// 支持两种方式：
-// 1. 通过查询参数 uuid 删除：DELETE /api/v1/speaker?uuid=xxx
-// 2. 通过路径参数 speaker_id 删除：DELETE /api/v1/speaker/:speaker_id（用于删除整个声纹组）
+// 支持两种方式（需提供 uid，可选 agent_id）：
+// 1. 按 uuid 删除单条声纹：DELETE /api/v1/speaker?uuid=xxx（路径无 speaker_id）
+// 2. 按 speaker_id 删除整组声纹：DELETE /api/v1/speaker/:speaker_id
 func (h *Handler) DeleteSpeaker(c *gin.Context) {
 	// 获取 UID
 	uid := getUIDFromRequest(c)

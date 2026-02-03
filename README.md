@@ -78,11 +78,26 @@ wget -O models/speaker/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.on
   https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/main/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
 ```
 
+#### Windows 本地构建（必读）
+本项目的 ASR/声纹 依赖 `sherpa-onnx-go`，该库通过 CGO 调用原生库，**在 Windows 上必须开启 CGO** 才能通过编译。若未开启，会报错：`build constraints exclude all Go files in ... sherpa-onnx-go-windows`。
+
+在 Windows（PowerShell 或 CMD）下请先设置环境变量再构建：
+```bash
+# PowerShell
+$env:CGO_ENABLED=1
+go build -o main.exe .
+
+# CMD
+set CGO_ENABLED=1
+go build -o main.exe .
+```
+或直接使用脚本：`scripts\build_windows.bat`。需已安装 MinGW（gcc）或 MSVC，并将 sherpa-onnx 的 DLL 放到可被加载的路径（如与 exe 同目录或 PATH）。
+
 #### 运行服务
 ```bash
 # 默认配置启动
 go run main.go
-# 或编译后运行
+# 或编译后运行（Linux/macOS）
 go build -o voice_server
 ./voice_server
 ```
@@ -98,6 +113,36 @@ go build -o voice_server
 
 ### 配置文件
 详细配置请参考 `config.json` 文件。
+
+### 声纹存储配置
+声纹识别支持两种存储方式，可通过 `speaker.storage_type` 配置选择：
+
+| 存储类型 | 说明 | 适用场景 |
+|---------|------|---------|
+| `json` | JSON 文件存储（默认） | 小型部署、开发测试、无需额外服务 |
+| `qdrant` | Qdrant 向量数据库 | 生产环境、大规模部署、需要高性能 |
+
+**JSON 存储配置示例：**
+```jsonc
+"speaker": {
+  "storage_type": "json",
+  "json_storage": {
+    "file_path": "data/speaker/speaker_embeddings.json"
+  }
+}
+```
+
+**Qdrant 存储配置示例：**
+```jsonc
+"speaker": {
+  "storage_type": "qdrant",
+  "vector_db": {
+    "host": "localhost",
+    "port": 6334,
+    "collection_name": "speaker_embeddings"
+  }
+}
+```
 
 ### 环境变量配置（Docker 部署推荐）
 为了支持 Docker 部署，以下配置项优先从环境变量读取，如果环境变量不存在则使用配置文件的值：

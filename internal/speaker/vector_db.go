@@ -14,6 +14,43 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
+// VectorDatabase 向量数据库接口
+// 定义了向量数据库的统一操作接口，支持多种存储后端（Qdrant、JSON等）
+type VectorDatabase interface {
+	// Init 初始化数据库
+	Init() error
+
+	// Close 关闭数据库连接
+	Close() error
+
+	// Insert 插入声纹向量
+	Insert(uid, agentID, speakerID, speakerName, uuid string, embedding []float32, sampleIndex int, createdAt, updatedAt int64) error
+
+	// Search 搜索相似向量（仅按 UID 过滤）
+	Search(uid string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error)
+
+	// SearchWithOptionalFilters 搜索相似向量（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）
+	SearchWithOptionalFilters(uid, agentID, speakerID, speakerName string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error)
+
+	// SearchWithFilter 搜索相似向量（严格按 UID、agent_id 和 speaker_id 过滤）
+	SearchWithFilter(uid, agentID, speakerID string, queryEmbedding []float32, threshold float32, topK int) ([]SearchResult, error)
+
+	// GetSpeakerSampleCount 获取说话人的样本数量
+	GetSpeakerSampleCount(uid, agentID, speakerID string) (int, error)
+
+	// GetSpeakerInfo 获取说话人信息
+	GetSpeakerInfo(uid, agentID, speakerID string) (*SpeakerInfo, error)
+
+	// GetAllSpeakers 获取所有说话人列表
+	GetAllSpeakers(uid, agentID string) ([]*SpeakerInfo, error)
+
+	// DeleteByFilters 删除说话人（通过过滤条件）
+	DeleteByFilters(uid, agentID, speakerID string) error
+
+	// DeleteByUUID 通过 UUID 删除说话人
+	DeleteByUUID(uid, agentID, uuid string) error
+}
+
 // QdrantConfig Qdrant 配置
 type QdrantConfig struct {
 	Host           string
@@ -54,13 +91,14 @@ func NewQdrantVectorDB(config *QdrantConfig, embeddingDim int) (*QdrantVectorDB,
 		embeddingDim:   embeddingDim,
 	}
 
-	// 确保 Collection 存在
-	ctx := context.Background()
-	if err := db.ensureCollectionExists(ctx); err != nil {
-		return nil, err
-	}
-
 	return db, nil
+}
+
+// Init 初始化 Qdrant 向量数据库（确保 Collection 存在）
+// 实现 VectorDatabase 接口
+func (db *QdrantVectorDB) Init() error {
+	ctx := context.Background()
+	return db.ensureCollectionExists(ctx)
 }
 
 // normalizeVector 对向量进行 L2 归一化
@@ -114,7 +152,7 @@ func (db *QdrantVectorDB) ensureCollectionExists(ctx context.Context) error {
 	return nil
 }
 
-// Insert 插入 embedding 到向量数据库
+// Insert 插入 embedding 到向量数据库；若 uid+agentID+uuid 已存在则更新该条（uuid 相同视为同一声纹）
 func (db *QdrantVectorDB) Insert(uid, agentID, speakerID, speakerName, uuid string, embedding []float32, sampleIndex int, createdAt, updatedAt int64) error {
 	ctx := context.Background()
 
@@ -123,29 +161,73 @@ func (db *QdrantVectorDB) Insert(uid, agentID, speakerID, speakerName, uuid stri
 		return fmt.Errorf("failed to ensure collection exists: %v", err)
 	}
 
-	// 注意：使用 Distance_Cosine 时，Qdrant 会自动对向量进行归一化
-	// 因此不需要在程序中手动归一化（即使传入的向量已经归一化，Qdrant 再次归一化也没问题）
-
-	// 生成唯一的 Point ID
-	pointID := generatePointID(uid, agentID, speakerID, sampleIndex)
-
-	// 构建 Point
-	point := &qdrant.PointStruct{
-		Id:      qdrant.NewIDNum(pointID),
-		Vectors: qdrant.NewVectors(embedding...),
-		Payload: qdrant.NewValueMap(map[string]any{
-			"uid":          uid,
-			"agent_id":     agentID,
-			"speaker_id":   speakerID,
-			"speaker_name": speakerName,
-			"uuid":         uuid,
-			"sample_index": sampleIndex,
-			"created_at":   createdAt,
-			"updated_at":   updatedAt,
-		}),
+	// 先按 uuid 查是否已有该声纹（uid+agentID+uuid 唯一）
+	conditions := []*qdrant.Condition{
+		qdrant.NewMatch("uid", uid),
+		qdrant.NewMatch("uuid", uuid),
+	}
+	if agentID != "" {
+		conditions = append(conditions, qdrant.NewMatch("agent_id", agentID))
+	}
+	filter := &qdrant.Filter{Must: conditions}
+	limit := uint32(1)
+	scrollResult, err := db.client.Scroll(ctx, &qdrant.ScrollPoints{
+		CollectionName: db.collectionName,
+		Filter:         filter,
+		Limit:          &limit,
+		WithPayload:    qdrant.NewWithPayload(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to scroll by uuid: %v", err)
 	}
 
-	_, err := db.client.Upsert(ctx, &qdrant.UpsertPoints{
+	var point *qdrant.PointStruct
+	if len(scrollResult) > 0 {
+		// uuid 已存在：用原 Point 的 Id 和 sample_index 做 Upsert（更新向量与 updated_at，保留 created_at）
+		existing := scrollResult[0]
+		payload := existing.GetPayload()
+		useSampleIndex := sampleIndex
+		useCreatedAt := createdAt
+		if val, ok := payload["sample_index"]; ok {
+			useSampleIndex = int(val.GetIntegerValue())
+		}
+		if val, ok := payload["created_at"]; ok {
+			useCreatedAt = val.GetIntegerValue()
+		}
+		point = &qdrant.PointStruct{
+			Id:      existing.Id,
+			Vectors: qdrant.NewVectors(embedding...),
+			Payload: qdrant.NewValueMap(map[string]any{
+				"uid":          uid,
+				"agent_id":     agentID,
+				"speaker_id":   speakerID,
+				"speaker_name": speakerName,
+				"uuid":         uuid,
+				"sample_index": useSampleIndex,
+				"created_at":   useCreatedAt,
+				"updated_at":   updatedAt,
+			}),
+		}
+	} else {
+		// uuid 不存在：按 sample_index 生成新 PointId 插入
+		pointID := generatePointID(uid, agentID, speakerID, sampleIndex)
+		point = &qdrant.PointStruct{
+			Id:      qdrant.NewIDNum(pointID),
+			Vectors: qdrant.NewVectors(embedding...),
+			Payload: qdrant.NewValueMap(map[string]any{
+				"uid":          uid,
+				"agent_id":     agentID,
+				"speaker_id":   speakerID,
+				"speaker_name": speakerName,
+				"uuid":         uuid,
+				"sample_index": sampleIndex,
+				"created_at":   createdAt,
+				"updated_at":   updatedAt,
+			}),
+		}
+	}
+
+	_, err = db.client.Upsert(ctx, &qdrant.UpsertPoints{
 		CollectionName: db.collectionName,
 		Points:         []*qdrant.PointStruct{point},
 	})
@@ -583,8 +665,9 @@ func (db *QdrantVectorDB) GetAllSpeakers(uid, agentID string) ([]*SpeakerInfo, e
 	return speakers, nil
 }
 
-// DeleteSpeaker 删除说话人的所有向量（通过 speaker_id）
-func (db *QdrantVectorDB) DeleteSpeaker(uid, agentID, speakerID string) error {
+// DeleteByFilters 删除说话人的所有向量（通过过滤条件）
+// 实现 VectorDatabase 接口
+func (db *QdrantVectorDB) DeleteByFilters(uid, agentID, speakerID string) error {
 	ctx := context.Background()
 
 	// 使用 Scroll API 获取所有匹配的 points
@@ -639,8 +722,9 @@ func (db *QdrantVectorDB) DeleteSpeaker(uid, agentID, speakerID string) error {
 	return nil
 }
 
-// DeleteSpeakerByUUID 通过 UUID 删除说话人的所有向量
-func (db *QdrantVectorDB) DeleteSpeakerByUUID(uid, agentID, uuid string) error {
+// DeleteByUUID 通过 UUID 删除说话人的所有向量
+// 实现 VectorDatabase 接口
+func (db *QdrantVectorDB) DeleteByUUID(uid, agentID, uuid string) error {
 	ctx := context.Background()
 
 	// 使用 Scroll API 获取所有匹配的 points（按 uuid 过滤）

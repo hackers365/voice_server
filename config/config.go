@@ -46,11 +46,15 @@ type Config struct {
 		DataDir          string  `mapstructure:"data_dir"`
 		SaveAudioOnFinish bool   `mapstructure:"save_audio_on_finish"`
 		AudioSaveDir     string  `mapstructure:"audio_save_dir"`
-		VectorDB         struct {
+		StorageType      string  `mapstructure:"storage_type"`
+		JSONStorage      struct {
+			FilePath string `mapstructure:"file_path"`
+		} `mapstructure:"json_storage"`
+		Qdrant struct {
 			Host           string `mapstructure:"host"`
 			Port           int    `mapstructure:"port"`
 			CollectionName string `mapstructure:"collection_name"`
-		} `mapstructure:"vector_db"`
+		} `mapstructure:"qdrant"`
 	} `mapstructure:"speaker"`
 	Audio struct {
 		SampleRate      int     `mapstructure:"sample_rate"`

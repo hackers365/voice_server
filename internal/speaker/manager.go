@@ -3,6 +3,7 @@ package speaker
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -20,8 +21,8 @@ type Manager struct {
 	embeddingDim int
 	dataDir      string
 
-	// Qdrant 向量数据库客户端（唯一存储）
-	vectorDB      *QdrantVectorDB
+	// 向量数据库客户端（支持多种后端：JSON、Qdrant）
+	vectorDB      VectorDatabase
 	vectorDBMutex sync.RWMutex
 
 	// VAD池（用于过滤静音）
@@ -36,12 +37,20 @@ type Config struct {
 	Threshold  float32 `json:"threshold"`
 	DataDir    string  `json:"data_dir"` // 保留用于其他用途（如临时文件）
 
-	// 向量数据库配置（必需）
-	VectorDB struct {
+	// 存储类型: "json" 或 "qdrant"（默认: "json"）
+	StorageType string `json:"storage_type"`
+
+	// JSON 存储配置
+	JSONStorage struct {
+		FilePath string `json:"file_path"` // JSON 文件路径
+	} `json:"json_storage"`
+
+	// Qdrant 存储配置
+	Qdrant struct {
 		Host           string `json:"host"`            // Qdrant 地址，默认 localhost
 		Port           int    `json:"port"`            // Qdrant 端口，默认 6334
 		CollectionName string `json:"collection_name"` // Collection 名称，默认 speaker_embeddings
-	} `json:"vector_db"`
+	} `json:"qdrant"`
 }
 
 // NewManager 创建声纹识别管理器
@@ -71,27 +80,68 @@ func NewManager(config *Config, vadPool pool.VADPoolInterface) (*Manager, error)
 	dim := extractor.Dim()
 	logger.Infof("Speaker embedding dimension: %d", dim)
 
-	// 初始化 Qdrant 向量数据库
-	qdrantConfig := &QdrantConfig{
-		Host:           config.VectorDB.Host,
-		Port:           config.VectorDB.Port,
-		CollectionName: config.VectorDB.CollectionName,
+	// 根据配置选择存储后端
+	var vectorDB VectorDatabase
+
+	// 默认使用 json
+	storageType := config.StorageType
+	if storageType == "" {
+		storageType = "json"
 	}
 
-	// 设置默认值
-	if qdrantConfig.Host == "" {
-		qdrantConfig.Host = "localhost"
-	}
-	if qdrantConfig.Port == 0 {
-		qdrantConfig.Port = 6334
-	}
-	if qdrantConfig.CollectionName == "" {
-		qdrantConfig.CollectionName = "speaker_embeddings"
-	}
+	switch storageType {
+	case "json":
+		// JSON 文件存储
+		jsonFilePath := config.JSONStorage.FilePath
+		if jsonFilePath == "" {
+			jsonFilePath = filepath.Join(config.DataDir, "speaker_embeddings.json")
+		}
 
-	vectorDB, err := NewQdrantVectorDB(qdrantConfig, dim)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize vector database: %v", err)
+		jsonDB, err := NewJSONVectorDB(&JSONVectorDBConfig{
+			FilePath:     jsonFilePath,
+			EmbeddingDim: dim,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize JSON vector database: %v", err)
+		}
+		vectorDB = jsonDB
+		logger.Infof("✅ Using JSON storage: %s", jsonFilePath)
+
+	case "qdrant":
+		// Qdrant 向量数据库
+		qdrantConfig := &QdrantConfig{
+			Host:           config.Qdrant.Host,
+			Port:           config.Qdrant.Port,
+			CollectionName: config.Qdrant.CollectionName,
+		}
+
+		// 设置默认值
+		if qdrantConfig.Host == "" {
+			qdrantConfig.Host = "localhost"
+		}
+		if qdrantConfig.Port == 0 {
+			qdrantConfig.Port = 6334
+		}
+		if qdrantConfig.CollectionName == "" {
+			qdrantConfig.CollectionName = "speaker_embeddings"
+		}
+
+		qdrantDB, err := NewQdrantVectorDB(qdrantConfig, dim)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize Qdrant vector database: %v", err)
+		}
+
+		// 初始化 Qdrant（确保 Collection 存在）
+		if err := qdrantDB.Init(); err != nil {
+			return nil, fmt.Errorf("failed to initialize Qdrant: %v", err)
+		}
+
+		vectorDB = qdrantDB
+		logger.Infof("✅ Using Qdrant storage: %s:%d, collection: %s",
+			qdrantConfig.Host, qdrantConfig.Port, qdrantConfig.CollectionName)
+
+	default:
+		return nil, fmt.Errorf("unknown storage type: %s (supported: json, qdrant)", config.StorageType)
 	}
 
 	manager := &Manager{
@@ -103,7 +153,7 @@ func NewManager(config *Config, vadPool pool.VADPoolInterface) (*Manager, error)
 		vadPool:      vadPool,
 	}
 
-	logger.Infof("✅ Speaker Manager initialized with Qdrant vector database and VAD pool")
+	logger.Infof("✅ Speaker Manager initialized with storage type: %s", storageType)
 	return manager, nil
 }
 
@@ -231,19 +281,19 @@ func (m *Manager) filterSilenceWithVADKeepEdges(audioData []float32, sampleRate 
 	}
 
 	hopSize := config.GlobalConfig.VAD.TenVAD.HopSize
-	
+
 	// 计算100ms对应的采样点数
 	silenceSamples := int(float64(sampleRate) * 0.1) // 100ms = 0.1秒
-	
+
 	// 记录每帧的VAD结果和位置
 	type frameInfo struct {
 		startIdx int
 		endIdx   int
 		isSpeech bool
 	}
-	
+
 	var frames []frameInfo
-	
+
 	// 分帧处理音频，记录每帧的VAD结果
 	for i := 0; i < len(audioData); i += hopSize {
 		end := i + hopSize
@@ -484,8 +534,8 @@ func (m *Manager) DeleteSpeaker(uid, agentID, speakerID string) error {
 		return fmt.Errorf("uid is required")
 	}
 
-	// 从 Qdrant 向量数据库删除
-	err := m.vectorDB.DeleteSpeaker(uid, agentID, speakerID)
+	// 从向量数据库删除
+	err := m.vectorDB.DeleteByFilters(uid, agentID, speakerID)
 	if err != nil {
 		return fmt.Errorf("failed to delete from vector database: %v", err)
 	}
@@ -505,7 +555,7 @@ func (m *Manager) DeleteSpeakerByUUID(uid, agentID, uuid string) error {
 	}
 
 	// 从 Qdrant 向量数据库删除
-	err := m.vectorDB.DeleteSpeakerByUUID(uid, agentID, uuid)
+	err := m.vectorDB.DeleteByUUID(uid, agentID, uuid)
 	if err != nil {
 		return fmt.Errorf("failed to delete from vector database: %v", err)
 	}

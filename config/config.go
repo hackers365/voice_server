@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -38,16 +39,16 @@ type Config struct {
 		Debug                       bool   `mapstructure:"debug"`
 	} `mapstructure:"recognition"`
 	Speaker struct {
-		Enabled          bool    `mapstructure:"enabled"`
-		ModelPath        string  `mapstructure:"model_path"`
-		NumThreads       int     `mapstructure:"num_threads"`
-		Provider         string  `mapstructure:"provider"`
-		Threshold        float32 `mapstructure:"threshold"`
-		DataDir          string  `mapstructure:"data_dir"`
-		SaveAudioOnFinish bool   `mapstructure:"save_audio_on_finish"`
-		AudioSaveDir     string  `mapstructure:"audio_save_dir"`
-		StorageType      string  `mapstructure:"storage_type"`
-		JSONStorage      struct {
+		Enabled           bool    `mapstructure:"enabled"`
+		ModelPath         string  `mapstructure:"model_path"`
+		NumThreads        int     `mapstructure:"num_threads"`
+		Provider          string  `mapstructure:"provider"`
+		Threshold         float32 `mapstructure:"threshold"`
+		DataDir           string  `mapstructure:"data_dir"`
+		SaveAudioOnFinish bool    `mapstructure:"save_audio_on_finish"`
+		AudioSaveDir      string  `mapstructure:"audio_save_dir"`
+		StorageType       string  `mapstructure:"storage_type"`
+		JSONStorage       struct {
 			FilePath string `mapstructure:"file_path"`
 		} `mapstructure:"json_storage"`
 		Qdrant struct {
@@ -114,27 +115,28 @@ type TenVADConf struct {
 }
 
 var GlobalConfig Config
+var cfgViper = viper.New()
 
 // InitConfig 初始化配置
 func InitConfig(configPath string) error {
 	// 设置配置文件名和路径
 	if configPath != "" {
-		viper.SetConfigFile(configPath)
+		cfgViper.SetConfigFile(configPath)
 	} else {
-		viper.SetConfigName("config")
-		viper.SetConfigType("json")
-		viper.AddConfigPath(".")
-		viper.AddConfigPath("./config")
-		viper.AddConfigPath("/etc/voice_server/")
+		cfgViper.SetConfigName("config")
+		cfgViper.SetConfigType("json")
+		cfgViper.AddConfigPath(".")
+		cfgViper.AddConfigPath("./config")
+		cfgViper.AddConfigPath("/etc/voice_server/")
 	}
 
 	// 设置环境变量前缀
-	viper.SetEnvPrefix("VAD_ASR")
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
+	cfgViper.SetEnvPrefix("VAD_ASR")
+	cfgViper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	cfgViper.AutomaticEnv()
 
 	// 读取配置文件
-	if err := viper.ReadInConfig(); err != nil {
+	if err := cfgViper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
 			// 配置文件未找到，使用默认值
 			fmt.Println("⚠️  Config file not found, using defaults")
@@ -143,15 +145,51 @@ func InitConfig(configPath string) error {
 			return fmt.Errorf("error reading config file: %w", err)
 		}
 	} else {
-		fmt.Printf("✅ Using config file: %s\n", viper.ConfigFileUsed())
+		fmt.Printf("✅ Using config file: %s\n", cfgViper.ConfigFileUsed())
 	}
 
 	// 将配置解析到结构体
-	if err := viper.Unmarshal(&GlobalConfig); err != nil {
+	if err := cfgViper.Unmarshal(&GlobalConfig); err != nil {
 		return fmt.Errorf("error unmarshaling config: %w", err)
 	}
 
+	// 将关键相对路径转换为基于配置文件目录的绝对路径，避免依赖进程 cwd。
+	normalizePathByConfigFile(&GlobalConfig, cfgViper.ConfigFileUsed())
+
 	return nil
+}
+
+func resolveRelativePath(baseDir, path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return path
+	}
+	if filepath.IsAbs(trimmed) {
+		return trimmed
+	}
+	if strings.HasPrefix(trimmed, "~") {
+		return trimmed
+	}
+	return filepath.Clean(filepath.Join(baseDir, trimmed))
+}
+
+func normalizePathByConfigFile(cfg *Config, configFile string) {
+	if cfg == nil || strings.TrimSpace(configFile) == "" {
+		return
+	}
+
+	baseDir := filepath.Dir(configFile)
+
+	cfg.VAD.SileroVAD.ModelPath = resolveRelativePath(baseDir, cfg.VAD.SileroVAD.ModelPath)
+	cfg.Recognition.ModelPath = resolveRelativePath(baseDir, cfg.Recognition.ModelPath)
+	cfg.Recognition.TokensPath = resolveRelativePath(baseDir, cfg.Recognition.TokensPath)
+
+	cfg.Speaker.ModelPath = resolveRelativePath(baseDir, cfg.Speaker.ModelPath)
+	cfg.Speaker.DataDir = resolveRelativePath(baseDir, cfg.Speaker.DataDir)
+	cfg.Speaker.AudioSaveDir = resolveRelativePath(baseDir, cfg.Speaker.AudioSaveDir)
+	cfg.Speaker.JSONStorage.FilePath = resolveRelativePath(baseDir, cfg.Speaker.JSONStorage.FilePath)
+
+	cfg.Logging.FilePath = resolveRelativePath(baseDir, cfg.Logging.FilePath)
 }
 
 // LoadConfig 加载配置文件（保持向后兼容）
@@ -166,7 +204,7 @@ func GetConfig() *Config {
 
 // GetViper 获取viper实例
 func GetViper() *viper.Viper {
-	return viper.GetViper()
+	return cfgViper
 }
 
 // WatchConfig 监听配置文件变化 (已废弃，使用HotReloadManager)
@@ -176,44 +214,44 @@ func WatchConfig(callback func()) {
 
 // SaveConfig 保存配置到文件
 func SaveConfig() error {
-	return viper.WriteConfig()
+	return cfgViper.WriteConfig()
 }
 
 // SaveConfigAs 保存配置到指定文件
 func SaveConfigAs(filename string) error {
-	return viper.WriteConfigAs(filename)
+	return cfgViper.WriteConfigAs(filename)
 }
 
 // SetConfigValue 设置配置值
 func SetConfigValue(key string, value interface{}) {
-	viper.Set(key, value)
+	cfgViper.Set(key, value)
 	// 重新解析到结构体
-	viper.Unmarshal(&GlobalConfig)
+	cfgViper.Unmarshal(&GlobalConfig)
 }
 
 // GetConfigValue 获取配置值
 func GetConfigValue(key string) interface{} {
-	return viper.Get(key)
+	return cfgViper.Get(key)
 }
 
 // GetString 获取字符串配置值
 func GetString(key string) string {
-	return viper.GetString(key)
+	return cfgViper.GetString(key)
 }
 
 // GetInt 获取整数配置值
 func GetInt(key string) int {
-	return viper.GetInt(key)
+	return cfgViper.GetInt(key)
 }
 
 // GetBool 获取布尔配置值
 func GetBool(key string) bool {
-	return viper.GetBool(key)
+	return cfgViper.GetBool(key)
 }
 
 // GetFloat64 获取浮点数配置值
 func GetFloat64(key string) float64 {
-	return viper.GetFloat64(key)
+	return cfgViper.GetFloat64(key)
 }
 
 // PrintConfig 打印当前配置

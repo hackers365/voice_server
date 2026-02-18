@@ -430,14 +430,10 @@ func (m *Manager) RegisterSpeaker(uid, agentID, speakerID, speakerName, uuid str
 	return nil
 }
 
-// IdentifySpeaker 识别声纹（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）
-// uid: 用户ID，如果为空字符串则不作为过滤条件
-// agentID: Agent ID，如果为空字符串则不作为过滤条件
-// speakerID: 说话人ID，如果为空字符串则不作为过滤条件
-// speakerName: 说话人名称，如果为空字符串则不作为过滤条件
-// threshold: 识别阈值，如果 <= 0 则使用默认阈值
+// IdentifySpeaker 识别声纹（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）。
+// threshold: 识别阈值，如果 <= 0 则使用默认阈值。
 func (m *Manager) IdentifySpeaker(uid, agentID, speakerID, speakerName string, audioData []float32, sampleRate int, threshold ...float32) (*IdentifyResult, error) {
-	// 确定使用的阈值：如果传入了有效的阈值（> 0），使用传入的；否则使用默认阈值
+	// 确定使用的阈值：如果传入了有效的阈值（>0），使用传入的；否则使用默认阈值
 	useThreshold := m.threshold
 	if len(threshold) > 0 && threshold[0] > 0 {
 		useThreshold = threshold[0]
@@ -659,12 +655,8 @@ type StreamingIdentifier struct {
 	isFinished  bool
 }
 
-// NewStreamingIdentifier 创建流式识别器（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）
-// uid: 用户ID，如果为空字符串则不作为过滤条件
-// agentID: Agent ID，如果为空字符串则不作为过滤条件
-// speakerID: 说话人ID，如果为空字符串则不作为过滤条件
-// speakerName: 说话人名称，如果为空字符串则不作为过滤条件
-// threshold: 识别阈值，如果 <= 0 则使用默认阈值
+// NewStreamingIdentifier 创建流式识别器（支持可选的 UID、agent_id、speaker_id 和 speaker_name 过滤）。
+// threshold: 识别阈值，如果 <= 0 则使用默认阈值。
 func (m *Manager) NewStreamingIdentifier(uid, agentID, speakerID, speakerName string, sampleRate int, threshold ...float32) *StreamingIdentifier {
 	stream := m.extractor.CreateStream()
 	useThreshold := m.threshold

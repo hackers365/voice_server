@@ -16,7 +16,7 @@ func NewRouter(deps *bootstrap.AppDependencies) *gin.Engine {
 
 	// 注册基础路由
 	ginRouter.GET("/ws", func(c *gin.Context) {
-		ws.HandleWebSocket(c.Writer, c.Request, deps.SessionManager, deps.GlobalRecognizer)
+		ws.HandleWebSocket(c.Writer, c.Request, deps.SessionManager)
 	})
 	ginRouter.GET("/health", handlers.HealthHandler(deps))
 	ginRouter.GET("/stats", handlers.StatsHandler(deps))

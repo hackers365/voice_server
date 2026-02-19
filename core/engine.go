@@ -98,6 +98,7 @@ type engine struct {
 	vadPool    pool.VADPoolInterface
 	speakerMu  sync.RWMutex
 	speaker    SpeakerService
+	startTime  time.Time
 
 	sessions map[string]*sessionState
 	mu       sync.RWMutex
@@ -144,6 +145,7 @@ func NewEngine(recognizer *sherpa.OfflineRecognizer, vadPool pool.VADPoolInterfa
 		recognizer: recognizer,
 		vadPool:    vadPool,
 		speaker:    speakerService,
+		startTime:  time.Now(),
 		sessions:   make(map[string]*sessionState),
 	}
 }
@@ -770,8 +772,14 @@ func (e *engine) GetStats() map[string]interface{} {
 		"current_sessions": currentSessions,
 	}
 
+	startTime := e.startTime
+	if startTime.IsZero() {
+		startTime = time.Now()
+	}
+
 	return map[string]interface{}{
 		"timestamp":        time.Now().Format(time.RFC3339),
+		"start_time":       startTime.Format(time.RFC3339),
 		"total_sessions":   totalSessions,
 		"active_sessions":  activeSessions,
 		"total_messages":   totalMessages,

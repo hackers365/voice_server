@@ -88,6 +88,7 @@ type Engine interface {
 	NewSpeakerStreamingSession(uid, agentID, speakerID, speakerName string, sampleRate int, threshold ...float32) (SpeakerStreamingSession, error)
 
 	GetStats() map[string]interface{}
+	GetHealth() map[string]interface{}
 	Shutdown()
 }
 
@@ -746,6 +747,10 @@ func (e *engine) GetStats() map[string]interface{} {
 	currentSessions := len(e.sessions)
 	e.mu.RUnlock()
 
+	totalSessions := atomic.LoadInt64(&e.totalSessions)
+	activeSessions := atomic.LoadInt64(&e.activeSessions)
+	totalMessages := atomic.LoadInt64(&e.totalMessages)
+
 	var poolStats map[string]interface{}
 	if e.vadPool != nil {
 		poolStats = e.vadPool.GetStats()
@@ -753,12 +758,95 @@ func (e *engine) GetStats() map[string]interface{} {
 		poolStats = map[string]interface{}{"status": "not_initialized"}
 	}
 
-	return map[string]interface{}{
-		"total_sessions":   atomic.LoadInt64(&e.totalSessions),
-		"active_sessions":  atomic.LoadInt64(&e.activeSessions),
-		"total_messages":   atomic.LoadInt64(&e.totalMessages),
+	speakerStats := map[string]interface{}{"status": "disabled"}
+	if service := e.getSpeakerService(); service != nil {
+		speakerStats = service.GetStats("", "")
+	}
+
+	sessionStats := map[string]interface{}{
+		"total_sessions":   totalSessions,
+		"active_sessions":  activeSessions,
+		"total_messages":   totalMessages,
 		"current_sessions": currentSessions,
-		"pool_stats":       poolStats,
+	}
+
+	return map[string]interface{}{
+		"timestamp":        time.Now().Format(time.RFC3339),
+		"total_sessions":   totalSessions,
+		"active_sessions":  activeSessions,
+		"total_messages":   totalMessages,
+		"current_sessions": currentSessions,
+		"sessions":         sessionStats,
+		"vad_pool":         poolStats,
+		"speaker":          speakerStats,
+	}
+}
+
+// GetHealth 获取引擎健康状态
+func (e *engine) GetHealth() map[string]interface{} {
+	status := "healthy"
+	components := make(map[string]interface{})
+
+	recognition := map[string]interface{}{}
+	if e.recognizer != nil {
+		recognition["status"] = "ready"
+		recognition["enabled"] = true
+	} else if config.GlobalConfig.Recognition.Enabled {
+		recognition["status"] = "not_initialized"
+		recognition["enabled"] = true
+		status = "initializing"
+	} else {
+		recognition["status"] = "disabled"
+		recognition["enabled"] = false
+	}
+	components["recognition"] = recognition
+
+	if e.vadPool != nil {
+		vadStats := e.vadPool.GetStats()
+		if vadStats == nil {
+			vadStats = map[string]interface{}{}
+		}
+		if _, ok := vadStats["status"]; !ok {
+			vadStats["status"] = "ready"
+		}
+		components["vad_pool"] = vadStats
+	} else {
+		components["vad_pool"] = map[string]interface{}{"status": "not_initialized"}
+		status = "initializing"
+	}
+
+	service := e.getSpeakerService()
+	switch {
+	case service != nil:
+		speakerStats := service.GetStats("", "")
+		if speakerStats == nil {
+			speakerStats = map[string]interface{}{}
+		}
+		if _, ok := speakerStats["status"]; !ok {
+			speakerStats["status"] = "ready"
+		}
+		components["speaker"] = speakerStats
+	case config.GlobalConfig.Speaker.Enabled:
+		components["speaker"] = map[string]interface{}{"status": "not_initialized"}
+		if status == "healthy" {
+			status = "degraded"
+		}
+	default:
+		components["speaker"] = map[string]interface{}{"status": "disabled"}
+	}
+
+	stats := e.GetStats()
+	components["sessions"] = map[string]interface{}{
+		"total_sessions":   stats["total_sessions"],
+		"active_sessions":  stats["active_sessions"],
+		"total_messages":   stats["total_messages"],
+		"current_sessions": stats["current_sessions"],
+	}
+
+	return map[string]interface{}{
+		"status":     status,
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"components": components,
 	}
 }
 

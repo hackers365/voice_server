@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // RateGuard 抽象限流能力，供 GuardedEngine 在进程内调用链复用。
@@ -23,10 +24,31 @@ type guardedEngine struct {
 	guard  RateGuard
 }
 
+type guardStatsProvider interface {
+	GetStats() map[string]interface{}
+}
+
 type guardedSpeakerStreamingSession struct {
 	session SpeakerStreamingSession
 	once    sync.Once
 	release func()
+}
+
+func defaultGuardedHealthComponents() map[string]interface{} {
+	return map[string]interface{}{
+		"vad_pool":   map[string]interface{}{"status": "not_initialized"},
+		"sessions":   map[string]interface{}{"status": "not_initialized"},
+		"rate_limit": map[string]interface{}{"status": "not_initialized"},
+		"speaker":    map[string]interface{}{"status": "disabled"},
+	}
+}
+
+func guardedNotInitializedHealth() map[string]interface{} {
+	return map[string]interface{}{
+		"status":     "not_initialized",
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"components": defaultGuardedHealthComponents(),
+	}
 }
 
 // NewGuardedEngine 创建带统一限流能力的 Engine 封装。
@@ -290,7 +312,55 @@ func (g *guardedEngine) GetStats() map[string]interface{} {
 	if err != nil {
 		return map[string]interface{}{"status": "not_initialized"}
 	}
-	return engine.GetStats()
+	stats := engine.GetStats()
+	if stats == nil {
+		stats = make(map[string]interface{})
+	}
+	if guardStats, ok := g.guard.(guardStatsProvider); ok && guardStats != nil {
+		stats["rate_limit"] = guardStats.GetStats()
+	}
+	return stats
+}
+
+func (g *guardedEngine) GetHealth() map[string]interface{} {
+	engine, err := g.base()
+	if err != nil {
+		return guardedNotInitializedHealth()
+	}
+
+	health := engine.GetHealth()
+	if health == nil {
+		health = guardedNotInitializedHealth()
+	}
+
+	if _, ok := health["timestamp"]; !ok {
+		health["timestamp"] = time.Now().Format(time.RFC3339)
+	}
+
+	components, ok := health["components"].(map[string]interface{})
+	if !ok || components == nil {
+		components = make(map[string]interface{})
+		health["components"] = components
+	}
+
+	if guardStats, ok := g.guard.(guardStatsProvider); ok && guardStats != nil {
+		rateStats := guardStats.GetStats()
+		if rateStats == nil {
+			rateStats = map[string]interface{}{}
+		}
+		if _, hasStatus := rateStats["status"]; !hasStatus {
+			if enabled, ok := rateStats["enabled"].(bool); ok && !enabled {
+				rateStats["status"] = "disabled"
+			} else {
+				rateStats["status"] = "ready"
+			}
+		}
+		components["rate_limit"] = rateStats
+	} else {
+		components["rate_limit"] = map[string]interface{}{"status": "disabled"}
+	}
+
+	return health
 }
 
 func (g *guardedEngine) Shutdown() {

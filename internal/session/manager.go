@@ -12,16 +12,10 @@ import (
 	"voice_server/internal/logger"
 )
 
-// SessionConn 抽象会话连接，便于替换 WS/GRPC/测试实现。
-type SessionConn interface {
-	WriteJSON(v interface{}) error
-	Close() error
-}
-
 // Session 仅负责连接与发送队列管理，不承载识别核心状态。
 type Session struct {
 	ID       string
-	Conn     SessionConn
+	Conn     core.SessionConn
 	LastSeen int64
 	closed   int32
 
@@ -62,7 +56,7 @@ func NewManager(engine core.Engine) *Manager {
 }
 
 // CreateSession 创建新会话。
-func (m *Manager) CreateSession(sessionID string, conn SessionConn) error {
+func (m *Manager) CreateSession(sessionID string, conn core.SessionConn) error {
 	if m.engine == nil {
 		return fmt.Errorf("engine is not initialized")
 	}
@@ -209,10 +203,6 @@ func (m *Manager) Shutdown() {
 
 	for _, id := range ids {
 		m.RemoveSession(id)
-	}
-
-	if m.engine != nil {
-		m.engine.Shutdown()
 	}
 	logger.Infof("✅ Session manager shutdown complete")
 }

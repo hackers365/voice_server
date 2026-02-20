@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"voice_server/config"
+	"voice_server/core"
 	"voice_server/internal/logger"
-	"voice_server/internal/session"
 
 	"github.com/gorilla/websocket"
 )
@@ -28,16 +28,9 @@ func GenerateSessionID() string {
 	return hex.EncodeToString(bytes)
 }
 
-// SessionManager 定义 WS 层所需的最小会话管理能力。
-type SessionManager interface {
-	CreateSession(sessionID string, conn session.SessionConn) error
-	RemoveSession(sessionID string)
-	HandleAudioMessage(sessionID string, audioData []byte) error
-}
-
 // HandleWebSocket 处理 WebSocket 连接
 // 依赖注入 sessionManager
-func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager SessionManager) {
+func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager core.SessionManager) {
 	conn, err := Upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Errorf("WebSocket upgrade failed: %v", err)

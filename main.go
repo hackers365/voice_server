@@ -43,6 +43,14 @@ func main() {
 		logger.Errorf("Failed to initialize app dependencies:%v", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if deps.HotReloadMgr != nil {
+			deps.HotReloadMgr.Stop()
+		}
+		if deps.Engine != nil {
+			deps.Engine.Shutdown()
+		}
+	}()
 
 	// 统一注册所有路由
 	r := router.NewRouter(deps)

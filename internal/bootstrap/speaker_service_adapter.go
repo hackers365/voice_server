@@ -87,6 +87,13 @@ func (a *speakerServiceAdapter) NewStreamingSession(uid, agentID, speakerID, spe
 	return &speakerStreamingSessionAdapter{session: session}, nil
 }
 
+func (a *speakerServiceAdapter) Close() {
+	if a == nil || a.manager == nil {
+		return
+	}
+	a.manager.Close()
+}
+
 func (a *speakerStreamingSessionAdapter) AcceptAudio(audioData []float32) error {
 	if a == nil || a.session == nil {
 		return fmt.Errorf("speaker streaming session is not initialized")

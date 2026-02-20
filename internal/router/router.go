@@ -16,7 +16,16 @@ func NewRouter(deps *bootstrap.AppDependencies) *gin.Engine {
 
 	// 注册基础路由
 	ginRouter.GET("/ws", func(c *gin.Context) {
-		ws.HandleWebSocket(c.Writer, c.Request, deps.SessionManager)
+		if deps == nil || deps.Engine == nil {
+			c.JSON(503, gin.H{"error": "engine is not initialized"})
+			return
+		}
+		sessionManager := deps.Engine.GetSessionManager()
+		if sessionManager == nil {
+			c.JSON(503, gin.H{"error": "session manager is not initialized"})
+			return
+		}
+		ws.HandleWebSocket(c.Writer, c.Request, sessionManager)
 	})
 	ginRouter.GET("/health", handlers.HealthHandler(deps))
 	ginRouter.GET("/stats", handlers.StatsHandler(deps))

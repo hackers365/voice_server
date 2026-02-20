@@ -17,7 +17,6 @@ import (
 )
 
 type AppDependencies struct {
-	SessionManager   *session.Manager
 	Engine           core.Engine
 	RateLimiter      *ratelimit.RateLimiter
 	SpeakerManager   *speaker.Manager
@@ -200,11 +199,19 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 		cfg.RateLimit.BurstSize,
 		cfg.RateLimit.MaxConnections,
 	)
-	guardedEngine := core.NewGuardedEngine(asrEngine, rateLimiter)
+	guardedEngine, err := core.NewGuardedEngine(asrEngine, rateLimiter, func(engine core.Engine) core.SessionManager {
+		return session.NewManager(engine)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize guarded engine: %v", err)
+	}
 
-	// 初始化会话管理器
+	// 会话管理器实现由外部提供，但由 Engine 在构造时创建并持有
 	logger.Infof("🔧 Initializing session manager...")
-	sessionManager := session.NewManager(guardedEngine)
+	sessionManager := guardedEngine.GetSessionManager()
+	if sessionManager == nil {
+		return nil, fmt.Errorf("session manager is not initialized")
+	}
 
 	var speakerHandler *speaker.Handler
 	if speakerManager != nil {
@@ -213,7 +220,6 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 
 	logger.Infof("✅ All components initialized successfully")
 	return &AppDependencies{
-		SessionManager:   sessionManager,
 		Engine:           guardedEngine,
 		RateLimiter:      rateLimiter,
 		SpeakerManager:   speakerManager,

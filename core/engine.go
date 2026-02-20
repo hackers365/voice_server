@@ -18,6 +18,23 @@ import (
 // ResultHandler 识别结果回调。
 type ResultHandler func(sessionID, result string, err error)
 
+// SessionConn 抽象连接对象，避免核心层绑定具体传输协议实现。
+type SessionConn interface {
+	WriteJSON(v interface{}) error
+	Close() error
+}
+
+// SessionManager 抽象会话管理能力，由引擎持有并统一管理生命周期。
+type SessionManager interface {
+	CreateSession(sessionID string, conn SessionConn) error
+	RemoveSession(sessionID string)
+	HandleAudioMessage(sessionID string, audioData []byte) error
+	Shutdown()
+}
+
+// SessionManagerFactory 用于由外部注入会话管理实现，但由 Engine 负责创建和销毁。
+type SessionManagerFactory func(engine Engine) SessionManager
+
 // SpeakerIdentifyResult 表示声纹识别结果。
 type SpeakerIdentifyResult struct {
 	Identified  bool    `json:"identified"`
@@ -87,6 +104,8 @@ type Engine interface {
 	GetSpeakerStats(uid, agentID string) map[string]interface{}
 	NewSpeakerStreamingSession(uid, agentID, speakerID, speakerName string, sampleRate int, threshold ...float32) (SpeakerStreamingSession, error)
 
+	GetSessionManager() SessionManager
+
 	GetStats() map[string]interface{}
 	GetHealth() map[string]interface{}
 	Shutdown()
@@ -123,8 +142,15 @@ type engine struct {
 	resultMu     sync.RWMutex
 	resultHandle ResultHandler
 
+	// 会话管理器由引擎统一持有和销毁，具体实现通过工厂注入。
+	sessionMu      sync.RWMutex
+	sessionManager SessionManager
+
 	// 关闭标记，避免 Shutdown 期间继续投递异步任务。
 	stopping int32
+
+	// 关闭幂等保护。
+	shutdownOnce sync.Once
 
 	// 统计信息
 	totalSessions  int64
@@ -210,6 +236,12 @@ func NewEngine(recognizer *sherpa.OfflineRecognizer, vadPool pool.VADPoolInterfa
 	}
 	e.initDecodeExecutor()
 	return e
+}
+
+func (e *engine) GetSessionManager() SessionManager {
+	e.sessionMu.RLock()
+	defer e.sessionMu.RUnlock()
+	return e.sessionManager
 }
 
 func (e *engine) initDecodeExecutor() {
@@ -408,6 +440,9 @@ func (e *engine) NewSpeakerStreamingSession(uid, agentID, speakerID, speakerName
 
 // OpenSession 注册一个会话状态。
 func (e *engine) OpenSession(sessionID string) error {
+	if atomic.LoadInt32(&e.stopping) == 1 {
+		return fmt.Errorf("engine is shutting down")
+	}
 	if e.vadPool == nil {
 		return fmt.Errorf("VAD pool is not initialized")
 	}
@@ -461,6 +496,9 @@ func (e *engine) CloseSession(sessionID string) {
 
 // ProcessAudioData 处理一段音频并触发异步识别。
 func (e *engine) ProcessAudioData(sessionID string, audioData []byte) error {
+	if atomic.LoadInt32(&e.stopping) == 1 {
+		return fmt.Errorf("engine is shutting down")
+	}
 	if e.recognizer == nil {
 		return fmt.Errorf("recognizer is not initialized")
 	}
@@ -744,6 +782,9 @@ const defaultInlineAppendTailMS = 400
 
 // RecognizeFloat32 直接识别整段 PCM 浮点采样（不经过 VAD 分段）。
 func (e *engine) RecognizeFloat32(samples []float32, sampleRate int) (string, error) {
+	if atomic.LoadInt32(&e.stopping) == 1 {
+		return "", fmt.Errorf("engine is shutting down")
+	}
 	if e.recognizer == nil {
 		return "", fmt.Errorf("recognizer is not initialized")
 	}
@@ -759,6 +800,9 @@ func (e *engine) RecognizeFloat32(samples []float32, sampleRate int) (string, er
 // RecognizeWithVAD 使用与实时会话一致的 VAD 规则执行一次性识别。
 // 该方法是对外可复用的核心能力，HTTP/WS/API 入口都应复用这一层。
 func (e *engine) RecognizeWithVAD(samples []float32, sampleRate int) (string, error) {
+	if atomic.LoadInt32(&e.stopping) == 1 {
+		return "", fmt.Errorf("engine is shutting down")
+	}
 	if e.recognizer == nil {
 		return "", fmt.Errorf("recognizer is not initialized")
 	}
@@ -1131,26 +1175,69 @@ func (e *engine) GetHealth() map[string]interface{} {
 
 // Shutdown 关闭引擎并释放会话占用资源。
 func (e *engine) Shutdown() {
-	atomic.StoreInt32(&e.stopping, 1)
+	e.shutdownOnce.Do(func() {
+		atomic.StoreInt32(&e.stopping, 1)
 
-	e.mu.RLock()
-	ids := make([]string, 0, len(e.sessions))
-	for id := range e.sessions {
-		ids = append(ids, id)
-	}
-	e.mu.RUnlock()
+		if manager := e.GetSessionManager(); manager != nil {
+			manager.Shutdown()
+		}
 
-	for _, id := range ids {
-		e.CloseSession(id)
-	}
+		e.mu.RLock()
+		ids := make([]string, 0, len(e.sessions))
+		for id := range e.sessions {
+			ids = append(ids, id)
+		}
+		e.mu.RUnlock()
 
-	if e.decodeQueue != nil {
-		close(e.decodeQueue)
-		e.decodeWG.Wait()
-		e.decodeQueue = nil
-	}
+		for _, id := range ids {
+			e.CloseSession(id)
+		}
 
-	e.decodeWorkers = 0
-	e.decodePool = nil
-	e.decodeRecognizers = nil
+		if e.decodeQueue != nil {
+			close(e.decodeQueue)
+			e.decodeWG.Wait()
+			e.decodeQueue = nil
+		}
+
+		e.decodeWorkers = 0
+		e.decodePool = nil
+
+		// 先关闭声纹服务，再关闭共享 VAD 池，避免顺序问题。
+		service := e.getSpeakerService()
+		if service != nil {
+			if closer, ok := service.(interface{ Close() }); ok {
+				closer.Close()
+			}
+			e.speakerMu.Lock()
+			e.speaker = nil
+			e.speakerMu.Unlock()
+		}
+
+		if e.vadPool != nil {
+			e.vadPool.Shutdown()
+			e.vadPool = nil
+		}
+
+		// legacy 路径与识别器释放通过 decodeMu 串行，避免并发释放。
+		e.decodeMu.Lock()
+		uniqueRecognizers := make(map[*sherpa.OfflineRecognizer]struct{}, len(e.decodeRecognizers)+1)
+		for _, rec := range e.decodeRecognizers {
+			if rec != nil {
+				uniqueRecognizers[rec] = struct{}{}
+			}
+		}
+		if e.recognizer != nil {
+			uniqueRecognizers[e.recognizer] = struct{}{}
+		}
+		for rec := range uniqueRecognizers {
+			sherpa.DeleteOfflineRecognizer(rec)
+		}
+		e.recognizer = nil
+		e.decodeRecognizers = nil
+		e.decodeMu.Unlock()
+
+		e.sessionMu.Lock()
+		e.sessionManager = nil
+		e.sessionMu.Unlock()
+	})
 }

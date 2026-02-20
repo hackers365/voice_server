@@ -80,16 +80,9 @@ func sharedDependencies() *bootstrap.AppDependencies {
 	return sharedDeps
 }
 
-// ensureSharedDependencies 初始化并复用 asr_server 的共享依赖。
-// 首次初始化后，后续调用将直接复用同一份 Engine/SessionManager/RateLimiter 等实例。
+// ensureSharedDependencies 初始化并替换 asr_server 的共享依赖。
+// 每次调用都会创建新实例并原子替换 current；旧实例在替换后关闭。
 func ensureSharedDependencies(configPath string, override configOverrideFunc) error {
-	sharedDepsMu.Lock()
-	defer sharedDepsMu.Unlock()
-
-	if sharedDeps != nil {
-		return nil
-	}
-
 	resolvedPath, err := resolveConfigPath(configPath)
 	if err != nil {
 		return err
@@ -119,7 +112,12 @@ func ensureSharedDependencies(configPath string, override configOverrideFunc) er
 		return fmt.Errorf("failed to initialize app dependencies: %w", err)
 	}
 
+	sharedDepsMu.Lock()
+	oldDeps := sharedDeps
 	sharedDeps = deps
+	sharedDepsMu.Unlock()
+
+	closeDependencies(oldDeps)
 	return nil
 }
 
@@ -129,4 +127,28 @@ func resolveConfigPath(configPath string) (string, error) {
 		return trimmed, nil
 	}
 	return "", fmt.Errorf("asr config path is required")
+}
+
+// Close 释放共享依赖，供 embed/http 停止阶段调用。
+func (p *EngineProvider) Close() {
+	sharedDepsMu.Lock()
+	deps := sharedDeps
+	sharedDeps = nil
+	sharedDepsMu.Unlock()
+
+	closeDependencies(deps)
+}
+
+func closeDependencies(deps *bootstrap.AppDependencies) {
+	if deps == nil {
+		return
+	}
+
+	if deps.HotReloadMgr != nil {
+		deps.HotReloadMgr.Stop()
+	}
+
+	if deps.Engine != nil {
+		deps.Engine.Shutdown()
+	}
 }

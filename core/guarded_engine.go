@@ -22,6 +22,9 @@ type ConnectionGuard interface {
 type guardedEngine struct {
 	engine Engine
 	guard  RateGuard
+
+	sessionMu      sync.RWMutex
+	sessionManager SessionManager
 }
 
 type guardStatsProvider interface {
@@ -52,11 +55,20 @@ func guardedNotInitializedHealth() map[string]interface{} {
 }
 
 // NewGuardedEngine 创建带统一限流能力的 Engine 封装。
-func NewGuardedEngine(engine Engine, guard RateGuard) Engine {
-	return &guardedEngine{
+// sessionFactory 可选，若提供则由 Engine 在初始化时创建并持有 SessionManager。
+func NewGuardedEngine(engine Engine, guard RateGuard, sessionFactory SessionManagerFactory) (Engine, error) {
+	g := &guardedEngine{
 		engine: engine,
 		guard:  guard,
 	}
+	if sessionFactory != nil {
+		manager := sessionFactory(g)
+		if manager == nil {
+			return nil, fmt.Errorf("session manager factory returned nil")
+		}
+		g.sessionManager = manager
+	}
+	return g, nil
 }
 
 func (g *guardedEngine) base() (Engine, error) {
@@ -142,6 +154,21 @@ func (g *guardedEngine) SetResultHandler(handler ResultHandler) {
 		return
 	}
 	engine.SetResultHandler(handler)
+}
+
+func (g *guardedEngine) GetSessionManager() SessionManager {
+	g.sessionMu.RLock()
+	manager := g.sessionManager
+	g.sessionMu.RUnlock()
+	if manager != nil {
+		return manager
+	}
+
+	engine, err := g.base()
+	if err != nil {
+		return nil
+	}
+	return engine.GetSessionManager()
 }
 
 func (g *guardedEngine) OpenSession(sessionID string) error {
@@ -369,4 +396,8 @@ func (g *guardedEngine) Shutdown() {
 		return
 	}
 	engine.Shutdown()
+
+	g.sessionMu.Lock()
+	g.sessionManager = nil
+	g.sessionMu.Unlock()
 }

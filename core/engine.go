@@ -103,12 +103,28 @@ type engine struct {
 	sessions map[string]*sessionState
 	mu       sync.RWMutex
 
-	// recognizer decode 过程串行化，避免并发下的底层不确定行为。
+	// legacy 模式下串行 decode；pool 模式下此锁不参与 decode。
 	decodeMu sync.Mutex
+
+	// 解码执行模式：legacy（回滚模式）或 pool（并发解码模式）。
+	decodeMode string
+
+	// pool 模式：解码任务有界队列与工作协程。
+	decodeQueue   chan decodeTask
+	decodeWorkers int
+	decodeWG      sync.WaitGroup
+
+	// pool 模式：识别器实例池。
+	decodePool        chan *sherpa.OfflineRecognizer
+	decodeRecognizers []*sherpa.OfflineRecognizer
+	decodeDroppedJobs int64
 
 	// 识别结果回调（由外层连接管理器注入）。
 	resultMu     sync.RWMutex
 	resultHandle ResultHandler
+
+	// 关闭标记，避免 Shutdown 期间继续投递异步任务。
+	stopping int32
 
 	// 统计信息
 	totalSessions  int64
@@ -129,6 +145,27 @@ type sessionState struct {
 	silenceFrameCount int
 }
 
+type decodeTask struct {
+	sessionID  string
+	samples    []float32
+	sampleRate int
+}
+
+const (
+	decodeModeLegacy   = "legacy"
+	decodeModePool     = "pool"
+	defaultDecodePool  = 4
+	defaultDecodeQueue = 512
+)
+
+type decodeEnqueueResult int
+
+const (
+	decodeEnqueueOK decodeEnqueueResult = iota
+	decodeEnqueueFull
+	decodeEnqueueClosed
+)
+
 var float32Pool = sync.Pool{}
 
 func getFloat32PoolSlice() []float32 {
@@ -139,14 +176,141 @@ func getFloat32PoolSlice() []float32 {
 	return make([]float32, chunkSize)
 }
 
+func buildRecognizerConfigFromGlobal() sherpa.OfflineRecognizerConfig {
+	c := sherpa.OfflineRecognizerConfig{}
+	c.FeatConfig.SampleRate = config.GlobalConfig.Audio.SampleRate
+	c.FeatConfig.FeatureDim = config.GlobalConfig.Audio.FeatureDim
+	c.ModelConfig.SenseVoice.Model = config.GlobalConfig.Recognition.ModelPath
+	c.ModelConfig.Tokens = config.GlobalConfig.Recognition.TokensPath
+	c.ModelConfig.NumThreads = config.GlobalConfig.Recognition.NumThreads
+	if config.GlobalConfig.Recognition.Debug {
+		c.ModelConfig.Debug = 1
+	}
+	c.ModelConfig.Provider = config.GlobalConfig.Recognition.Provider
+	return c
+}
+
+func newOfflineRecognizerFromGlobal() (*sherpa.OfflineRecognizer, error) {
+	cfg := buildRecognizerConfigFromGlobal()
+	recognizer := sherpa.NewOfflineRecognizer(&cfg)
+	if recognizer == nil {
+		return nil, fmt.Errorf("failed to create offline recognizer")
+	}
+	return recognizer, nil
+}
+
 // NewEngine 创建核心引擎，并在构建期注入可选的声纹服务。
 func NewEngine(recognizer *sherpa.OfflineRecognizer, vadPool pool.VADPoolInterface, speakerService SpeakerService) Engine {
-	return &engine{
+	e := &engine{
 		recognizer: recognizer,
 		vadPool:    vadPool,
 		speaker:    speakerService,
 		startTime:  time.Now(),
 		sessions:   make(map[string]*sessionState),
+	}
+	e.initDecodeExecutor()
+	return e
+}
+
+func (e *engine) initDecodeExecutor() {
+	mode := strings.ToLower(strings.TrimSpace(config.GlobalConfig.Recognition.DecodeMode))
+	switch mode {
+	case "", decodeModeLegacy:
+		mode = decodeModeLegacy
+	case decodeModePool:
+	default:
+		logger.Warnf("未知 decode_mode=%q，回退 legacy", mode)
+		mode = decodeModeLegacy
+	}
+	e.decodeMode = mode
+
+	if mode != decodeModePool {
+		logger.Infof("ASR decode mode=legacy（可通过 recognition.decode_mode=pool 启用并发解码）")
+		return
+	}
+
+	if e.recognizer == nil {
+		logger.Warnf("ASR decode pool 初始化失败：recognizer 未初始化，回退 legacy")
+		e.decodeMode = decodeModeLegacy
+		return
+	}
+
+	poolSize := config.GlobalConfig.Recognition.DecodePoolSize
+	if poolSize <= 0 {
+		poolSize = defaultDecodePool
+	}
+	queueSize := config.GlobalConfig.Recognition.DecodeQueueSize
+	if queueSize <= 0 {
+		queueSize = defaultDecodeQueue
+	}
+
+	if poolSize < 2 {
+		logger.Warnf("ASR decode pool_size=%d，不足以并发，回退 legacy", poolSize)
+		e.decodeMode = decodeModeLegacy
+		return
+	}
+
+	recognizers := make([]*sherpa.OfflineRecognizer, 0, poolSize)
+	recognizers = append(recognizers, e.recognizer)
+	for i := 1; i < poolSize; i++ {
+		rec, err := newOfflineRecognizerFromGlobal()
+		if err != nil {
+			logger.Warnf("创建解码识别器实例失败（idx=%d）：%v", i, err)
+			break
+		}
+		recognizers = append(recognizers, rec)
+	}
+
+	if len(recognizers) < 2 {
+		logger.Warnf("ASR decode pool 可用实例不足，回退 legacy")
+		e.decodeMode = decodeModeLegacy
+		return
+	}
+
+	e.decodeRecognizers = recognizers
+	e.decodePool = make(chan *sherpa.OfflineRecognizer, len(recognizers))
+	for _, rec := range recognizers {
+		e.decodePool <- rec
+	}
+
+	e.decodeQueue = make(chan decodeTask, queueSize)
+	e.decodeWorkers = len(recognizers)
+	for i := 0; i < e.decodeWorkers; i++ {
+		e.decodeWG.Add(1)
+		go e.decodeWorkerLoop()
+	}
+
+	logger.Infof(
+		"ASR decode mode=pool（recognizers=%d, queue_size=%d）。回滚开关：recognition.decode_mode=legacy",
+		len(recognizers),
+		queueSize,
+	)
+}
+
+func (e *engine) decodeWorkerLoop() {
+	defer e.decodeWG.Done()
+	for task := range e.decodeQueue {
+		text, err := e.decodeWithRecognizerPool(task.samples, task.sampleRate)
+		if err != nil || text != "" {
+			e.emitResult(task.sessionID, text, err)
+		}
+	}
+}
+
+func (e *engine) enqueueDecodeTask(task decodeTask) (result decodeEnqueueResult) {
+	if e.decodeQueue == nil {
+		return decodeEnqueueClosed
+	}
+	defer func() {
+		if recover() != nil {
+			result = decodeEnqueueClosed
+		}
+	}()
+	select {
+	case e.decodeQueue <- task:
+		return decodeEnqueueOK
+	default:
+		return decodeEnqueueFull
 	}
 }
 
@@ -488,6 +652,36 @@ func (e *engine) processTenVAD(sessionID string, state *sessionState, float32Sli
 }
 
 func (e *engine) decodeAsync(sessionID string, samples []float32, sampleRate int) {
+	if atomic.LoadInt32(&e.stopping) == 1 {
+		return
+	}
+
+	if e.decodeMode == decodeModePool {
+		task := decodeTask{
+			sessionID:  sessionID,
+			samples:    samples,
+			sampleRate: sampleRate,
+		}
+		switch e.enqueueDecodeTask(task) {
+		case decodeEnqueueOK:
+			return
+		case decodeEnqueueClosed:
+			if atomic.LoadInt32(&e.stopping) == 1 {
+				return
+			}
+			atomic.AddInt64(&e.decodeDroppedJobs, 1)
+			e.emitResult(sessionID, "", fmt.Errorf("decode queue is closed"))
+			return
+		case decodeEnqueueFull:
+			dropped := atomic.AddInt64(&e.decodeDroppedJobs, 1)
+			if dropped == 1 || dropped%100 == 0 {
+				logger.Warnf("ASR decode queue 已满，累计丢弃=%d（queue_size=%d）", dropped, cap(e.decodeQueue))
+			}
+			e.emitResult(sessionID, "", fmt.Errorf("decode queue is full"))
+			return
+		}
+	}
+
 	go func() {
 		text, err := e.decode(samples, sampleRate)
 		if err != nil || text != "" {
@@ -497,15 +691,47 @@ func (e *engine) decodeAsync(sessionID string, samples []float32, sampleRate int
 }
 
 func (e *engine) decode(samples []float32, sampleRate int) (string, error) {
+	if e.decodeMode == decodeModePool {
+		return e.decodeWithRecognizerPool(samples, sampleRate)
+	}
+	return e.decodeLegacy(samples, sampleRate)
+}
+
+func (e *engine) decodeLegacy(samples []float32, sampleRate int) (string, error) {
 	e.decodeMu.Lock()
 	defer e.decodeMu.Unlock()
 
-	stream := sherpa.NewOfflineStream(e.recognizer)
+	return e.decodeWithRecognizer(e.recognizer, samples, sampleRate)
+}
+
+func (e *engine) decodeWithRecognizerPool(samples []float32, sampleRate int) (string, error) {
+	if e.decodePool == nil {
+		return e.decodeLegacy(samples, sampleRate)
+	}
+	recognizer := <-e.decodePool
+	if recognizer == nil {
+		return "", fmt.Errorf("decode recognizer is nil")
+	}
+	defer func() {
+		e.decodePool <- recognizer
+	}()
+	return e.decodeWithRecognizer(recognizer, samples, sampleRate)
+}
+
+func (e *engine) decodeWithRecognizer(recognizer *sherpa.OfflineRecognizer, samples []float32, sampleRate int) (string, error) {
+	if recognizer == nil {
+		return "", fmt.Errorf("recognizer is not initialized")
+	}
+	if sampleRate <= 0 {
+		sampleRate = config.GlobalConfig.Audio.SampleRate
+	}
+
+	stream := sherpa.NewOfflineStream(recognizer)
 	defer sherpa.DeleteOfflineStream(stream)
 
 	stream.AcceptWaveform(sampleRate, samples)
 
-	e.recognizer.Decode(stream)
+	recognizer.Decode(stream)
 
 	result := stream.GetResult()
 	if result == nil {
@@ -743,6 +969,35 @@ func (e *engine) emitResult(sessionID, result string, err error) {
 	}
 }
 
+func (e *engine) getDecodeStats() map[string]interface{} {
+	stats := map[string]interface{}{
+		"mode":         e.decodeMode,
+		"dropped_jobs": atomic.LoadInt64(&e.decodeDroppedJobs),
+	}
+
+	if e.decodeMode == decodeModePool {
+		queueLen := 0
+		queueSize := 0
+		availableRecognizers := 0
+
+		if e.decodeQueue != nil {
+			queueLen = len(e.decodeQueue)
+			queueSize = cap(e.decodeQueue)
+		}
+		if e.decodePool != nil {
+			availableRecognizers = len(e.decodePool)
+		}
+
+		stats["workers"] = e.decodeWorkers
+		stats["recognizers"] = len(e.decodeRecognizers)
+		stats["queue_len"] = queueLen
+		stats["queue_size"] = queueSize
+		stats["pool_available"] = availableRecognizers
+	}
+
+	return stats
+}
+
 // GetStats 获取核心引擎统计信息。
 func (e *engine) GetStats() map[string]interface{} {
 	e.mu.RLock()
@@ -764,6 +1019,7 @@ func (e *engine) GetStats() map[string]interface{} {
 	if service := e.getSpeakerService(); service != nil {
 		speakerStats = service.GetStats("", "")
 	}
+	decodeStats := e.getDecodeStats()
 
 	sessionStats := map[string]interface{}{
 		"total_sessions":   totalSessions,
@@ -787,6 +1043,7 @@ func (e *engine) GetStats() map[string]interface{} {
 		"sessions":         sessionStats,
 		"vad_pool":         poolStats,
 		"speaker":          speakerStats,
+		"decode":           decodeStats,
 	}
 }
 
@@ -843,6 +1100,20 @@ func (e *engine) GetHealth() map[string]interface{} {
 		components["speaker"] = map[string]interface{}{"status": "disabled"}
 	}
 
+	decodeStats := e.getDecodeStats()
+	if e.decodeMode == decodeModePool {
+		decodeStats["status"] = "ready"
+		if e.decodeQueue == nil || e.decodePool == nil {
+			decodeStats["status"] = "not_initialized"
+			if status == "healthy" {
+				status = "degraded"
+			}
+		}
+	} else {
+		decodeStats["status"] = "legacy"
+	}
+	components["decode"] = decodeStats
+
 	stats := e.GetStats()
 	components["sessions"] = map[string]interface{}{
 		"total_sessions":   stats["total_sessions"],
@@ -860,6 +1131,8 @@ func (e *engine) GetHealth() map[string]interface{} {
 
 // Shutdown 关闭引擎并释放会话占用资源。
 func (e *engine) Shutdown() {
+	atomic.StoreInt32(&e.stopping, 1)
+
 	e.mu.RLock()
 	ids := make([]string, 0, len(e.sessions))
 	for id := range e.sessions {
@@ -870,4 +1143,14 @@ func (e *engine) Shutdown() {
 	for _, id := range ids {
 		e.CloseSession(id)
 	}
+
+	if e.decodeQueue != nil {
+		close(e.decodeQueue)
+		e.decodeWG.Wait()
+		e.decodeQueue = nil
+	}
+
+	e.decodeWorkers = 0
+	e.decodePool = nil
+	e.decodeRecognizers = nil
 }

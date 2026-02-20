@@ -37,6 +37,9 @@ type Config struct {
 		NumThreads                  int    `mapstructure:"num_threads"`
 		Provider                    string `mapstructure:"provider"`
 		Debug                       bool   `mapstructure:"debug"`
+		DecodeMode                  string `mapstructure:"decode_mode"`       // legacy/pool
+		DecodePoolSize              int    `mapstructure:"decode_pool_size"`  // 解码器实例数
+		DecodeQueueSize             int    `mapstructure:"decode_queue_size"` // 解码任务队列长度
 	} `mapstructure:"recognition"`
 	Speaker struct {
 		Enabled           bool    `mapstructure:"enabled"`
@@ -260,6 +263,9 @@ func PrintConfig() {
 	fmt.Printf("  Server: %s:%d\n", GlobalConfig.Server.Host, GlobalConfig.Server.Port)
 	fmt.Printf("  VAD Model: %s\n", GlobalConfig.VAD.SileroVAD.ModelPath)
 	fmt.Printf("  ASR Model: %s\n", GlobalConfig.Recognition.ModelPath)
+	fmt.Printf("  Decode Mode: %s\n", GlobalConfig.Recognition.DecodeMode)
+	fmt.Printf("  Decode Pool Size: %d\n", GlobalConfig.Recognition.DecodePoolSize)
+	fmt.Printf("  Decode Queue Size: %d\n", GlobalConfig.Recognition.DecodeQueueSize)
 	fmt.Printf("  Pool Workers: %d\n", GlobalConfig.Pool.WorkerCount)
 	fmt.Printf("  VAD Pool Size: %d\n", GlobalConfig.VAD.PoolSize)
 	fmt.Printf("  Log Level: %s\n", GlobalConfig.Logging.Level)

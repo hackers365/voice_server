@@ -773,7 +773,7 @@ func (e *engine) decodeWithRecognizer(recognizer *sherpa.OfflineRecognizer, samp
 
 	result := stream.GetResult()
 	if result == nil {
-		return "", fmt.Errorf("recognition failed")
+		return "", ErrRecognitionFailed
 	}
 	return result.Text, nil
 }

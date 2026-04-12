@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-audio/audio"
@@ -20,9 +21,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var (
+	baseURL      = "http://127.0.0.1:9000"
+	speakerAPI   = baseURL + "/api/v1/speaker"
+	speakerWSURL = "ws://127.0.0.1:9000/api/v1/speaker/identify_ws"
+)
+
 const (
-	baseURL        = "http://192.168.209.138:9000"
-	speakerAPI     = baseURL + "/api/v1/speaker"
 	speakerID      = "test_speaker_001"
 	speakerName    = "测试说话人"
 	defaultUID     = "test_user_001"
@@ -88,6 +93,10 @@ func main() {
 	var customUUID string
 	var maxFrames int
 	var threshold float64
+	var peekStartMs int
+	var peekIntervalMs int
+	var customBaseURL string
+	var customSpeakerWSURL string
 
 	flag.StringVar(&registerFile, "register", "", "注册声纹的音频文件路径（WAV格式）")
 	flag.StringVar(&identifyFile, "identify", "", "识别声纹的音频文件路径（WAV格式）")
@@ -100,11 +109,32 @@ func main() {
 	flag.StringVar(&customUUID, "uuid", defaultUUID, "注册会话UUID（默认：test_uuid_001，服务端必填）")
 	flag.IntVar(&maxFrames, "frames", 0, "流式识别时发送的帧数（0表示发送所有帧，可选）")
 	flag.Float64Var(&threshold, "threshold", 0, "识别阈值（>0时使用，否则使用服务端默认值，可选）")
+	flag.IntVar(&peekStartMs, "peek-start-ms", 1200, "流式识别中首次发送peek的累计音频时长（毫秒，<=0表示不发送peek）")
+	flag.IntVar(&peekIntervalMs, "peek-interval-ms", 200, "流式识别中peek发送间隔（毫秒，<=0表示只发送一次peek）")
+	flag.StringVar(&customBaseURL, "base-url", baseURL, "服务HTTP地址（例如：http://127.0.0.1:9000）")
+	flag.StringVar(&customSpeakerWSURL, "speaker-ws-url", "", "声纹WS地址（留空则按base-url自动推导）")
 	flag.Parse()
+
+	baseURL = strings.TrimRight(customBaseURL, "/")
+	speakerAPI = baseURL + "/api/v1/speaker"
+	if customSpeakerWSURL != "" {
+		speakerWSURL = customSpeakerWSURL
+	} else {
+		switch {
+		case strings.HasPrefix(baseURL, "https://"):
+			speakerWSURL = "wss://" + strings.TrimPrefix(baseURL, "https://") + "/api/v1/speaker/identify_ws"
+		case strings.HasPrefix(baseURL, "http://"):
+			speakerWSURL = "ws://" + strings.TrimPrefix(baseURL, "http://") + "/api/v1/speaker/identify_ws"
+		default:
+			speakerWSURL = "ws://" + baseURL + "/api/v1/speaker/identify_ws"
+		}
+	}
 
 	fmt.Println("========================================")
 	fmt.Println("声纹识别测试程序")
 	fmt.Println("========================================")
+	fmt.Printf("服务地址: %s\n", baseURL)
+	fmt.Printf("声纹WS地址: %s\n", speakerWSURL)
 
 	// 如果所有参数都没有指定，显示使用说明
 	if registerFile == "" && identifyFile == "" && !listSpeakers && deleteSpeakerID == "" {
@@ -126,6 +156,10 @@ func main() {
 		fmt.Println("  -uuid <UUID>            注册会话UUID（可选，默认：test_uuid_001，注册时服务端必填）")
 		fmt.Println("  -frames <帧数>         流式识别时发送的帧数（0表示发送所有帧，可选）")
 		fmt.Println("  -threshold <阈值>      识别阈值（>0时使用，否则使用服务端默认值，可选）")
+		fmt.Println("  -peek-start-ms <毫秒>   流式识别首次peek时间点（<=0不发送peek）")
+		fmt.Println("  -peek-interval-ms <毫秒> peek发送间隔（<=0只发送一次peek）")
+		fmt.Println("  -base-url <URL>        服务HTTP地址（默认：http://127.0.0.1:9000）")
+		fmt.Println("  -speaker-ws-url <URL>  声纹WS地址（默认按base-url自动推导）")
 		fmt.Println("\n示例:")
 		fmt.Println("  # 仅注册声纹")
 		fmt.Println("  go run test_speaker.go -register register.wav")
@@ -142,6 +176,10 @@ func main() {
 		fmt.Println("  go run test_speaker.go -identify test.wav -frames 10")
 		fmt.Println("  # 使用自定义阈值识别")
 		fmt.Println("  go run test_speaker.go -identify test.wav -threshold 0.7")
+		fmt.Println("  # 流式识别中获取中间结果（peek）")
+		fmt.Println("  go run test_speaker.go -identify test.wav -peek-start-ms 1200 -peek-interval-ms 200")
+		fmt.Println("  # 指定测试服务地址")
+		fmt.Println("  go run test_speaker.go -identify test.wav -base-url http://127.0.0.1:9000")
 		os.Exit(1)
 	}
 
@@ -290,8 +328,13 @@ func main() {
 		if threshold > 0 {
 			fmt.Printf(", 阈值: %.4f", threshold)
 		}
+		if peekStartMs > 0 {
+			fmt.Printf(", peek起始: %dms, peek间隔: %dms", peekStartMs, peekIntervalMs)
+		} else {
+			fmt.Printf(", peek: 关闭")
+		}
 		fmt.Println(")...")
-		wsResult, err := identifySpeakerWebSocket(identifyPath, customUID, customAgentID, maxFrames, threshold)
+		wsResult, err := identifySpeakerWebSocket(identifyPath, customUID, customAgentID, maxFrames, threshold, peekStartMs, peekIntervalMs)
 		if err != nil {
 			fmt.Printf("❌ WebSocket 识别失败: %v\n", err)
 			os.Exit(1)
@@ -591,7 +634,9 @@ func float32ToBytes(samples []float32) []byte {
 // identifySpeakerWebSocket 通过WebSocket流式识别声纹
 // maxFrames: 要发送的最大帧数，0表示发送所有帧
 // threshold: 识别阈值，如果 <= 0 则使用服务端默认值
-func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFrames int, threshold float64) (*IdentifyResult, error) {
+// peekStartMs: 首次peek时机（毫秒，<=0表示不发送peek）
+// peekIntervalMs: peek间隔（毫秒，<=0表示只发送一次peek）
+func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFrames int, threshold float64, peekStartMs int, peekIntervalMs int) (*IdentifyResult, error) {
 	// 读取WAV文件
 	audioData, sampleRate, err := readWavToFloat32(wavPath)
 	if err != nil {
@@ -605,7 +650,7 @@ func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFra
 
 	// 连接WebSocket，传入原始采样率和uid
 	// 服务端会根据传入的采样率自动重采样到模型期望的采样率（通常是16000Hz）
-	wsURL := fmt.Sprintf("ws://192.168.208.214:8080/api/v1/speaker/identify_ws?sample_rate=%d&uid=%s", sampleRate, uid)
+	wsURL := fmt.Sprintf("%s?sample_rate=%d&uid=%s", speakerWSURL, sampleRate, uid)
 	if agentID != "" {
 		wsURL += fmt.Sprintf("&agent_id=%s", url.QueryEscape(agentID))
 	}
@@ -652,6 +697,22 @@ func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFra
 		fmt.Printf("   开始发送音频数据（分 %d 块，每块约 %d 样本）...\n", totalChunks, chunkSize)
 	}
 
+	// peek 调度配置（按累计发送音频时长触发）
+	peekEnabled := peekStartMs > 0
+	peekStartSamples := sampleRate * peekStartMs / 1000
+	peekIntervalSamples := sampleRate * peekIntervalMs / 1000
+	if peekEnabled {
+		if peekStartSamples <= 0 {
+			peekStartSamples = 1
+		}
+		if peekIntervalSamples <= 0 {
+			peekIntervalSamples = 0 // 仅发送一次
+		}
+		fmt.Printf("   🔎 已启用peek: start=%dms, interval=%dms\n", peekStartMs, peekIntervalMs)
+	}
+	nextPeekSamples := peekStartSamples
+	peekSeq := 0
+
 	// 启动goroutine接收消息
 	resultChan := make(chan *IdentifyResult, 1)
 	errorChan := make(chan error, 1)
@@ -679,6 +740,38 @@ func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFra
 						// 音频接收确认
 						if samples, ok := msg["samples"].(float64); ok {
 							fmt.Printf("   📦 服务器确认收到 %d 样本\n", int(samples))
+						}
+						continue
+					case "partial_result":
+						requestID := getString(msg, "request_id")
+						throttled := getBool(msg, "throttled")
+						round := 0
+						if v, ok := msg["round"].(float64); ok {
+							round = int(v)
+						}
+						audioMs := 0.0
+						if v, ok := msg["audio_ms"].(float64); ok {
+							audioMs = v
+						}
+						if throttled {
+							fmt.Printf("   ⏱️  peek(%s) 被限流，round=%d, audio=%.0fms\n", requestID, round, audioMs)
+							continue
+						}
+						if resultData, ok := msg["result"].(map[string]interface{}); ok {
+							identified := getBool(resultData, "identified")
+							if identified {
+								fmt.Printf("   🔍 peek(%s): round=%d, audio=%.0fms, speaker=%s(%s), conf=%.4f, th=%.4f\n",
+									requestID, round, audioMs,
+									getString(resultData, "speaker_name"),
+									getString(resultData, "speaker_id"),
+									getFloat32(resultData, "confidence"),
+									getFloat32(resultData, "threshold"),
+								)
+							} else {
+								fmt.Printf("   🔍 peek(%s): round=%d, audio=%.0fms, 暂未识别到匹配说话人\n", requestID, round, audioMs)
+							}
+						} else if errMsg, ok := msg["error"].(string); ok {
+							fmt.Printf("   ⚠️  peek(%s) 返回错误: %s\n", requestID, errMsg)
 						}
 						continue
 					case "result":
@@ -732,6 +825,28 @@ func identifySpeakerWebSocket(wavPath string, uid string, agentID string, maxFra
 
 		if err := conn.WriteMessage(websocket.BinaryMessage, chunkBytes); err != nil {
 			return nil, fmt.Errorf("发送音频数据失败: %v", err)
+		}
+
+		// 在发送过程中按计划发送 peek 请求（可多次）
+		for peekEnabled && totalSamplesSent >= nextPeekSamples {
+			peekSeq++
+			requestID := fmt.Sprintf("peek_%d", peekSeq)
+			peekCmd := map[string]interface{}{
+				"action":     "peek",
+				"request_id": requestID,
+			}
+			if err := conn.WriteJSON(peekCmd); err != nil {
+				return nil, fmt.Errorf("发送peek命令失败: %v", err)
+			}
+			fmt.Printf("   🔎 已发送peek请求 %s (累计音频 %.0fms)\n",
+				requestID, float64(totalSamplesSent)/float64(sampleRate)*1000)
+
+			// interval<=0 只发一次peek
+			if peekIntervalSamples <= 0 {
+				peekEnabled = false
+				break
+			}
+			nextPeekSamples += peekIntervalSamples
 		}
 
 		// 显示发送进度

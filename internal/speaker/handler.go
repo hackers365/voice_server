@@ -105,8 +105,8 @@ func (h *Handler) RegisterRoutes(router *gin.Engine) {
 		speakerGroup.GET("/list", h.GetAllSpeakers)
 
 		// 删除说话人（支持两种方式）
-		speakerGroup.DELETE("", h.DeleteSpeaker)              // DELETE /api/v1/speaker?uuid=xxx
-		speakerGroup.DELETE("/:speaker_id", h.DeleteSpeaker)  // DELETE /api/v1/speaker/:speaker_id
+		speakerGroup.DELETE("", h.DeleteSpeaker)             // DELETE /api/v1/speaker?uuid=xxx
+		speakerGroup.DELETE("/:speaker_id", h.DeleteSpeaker) // DELETE /api/v1/speaker/:speaker_id
 
 		// 获取数据库统计信息
 		speakerGroup.GET("/stats", h.GetStats)
@@ -575,6 +575,7 @@ var WebSocketUpgrader = websocket.Upgrader{
 
 // IdentifySpeakerWebSocket WebSocket流式识别声纹
 // 支持连接复用和多轮次识别：
+// - 发送 {"action": "peek"} 获取当前轮次的中间识别结果（不结束当前轮次）
 // - 发送 {"action": "finish"} 完成当前轮次识别，返回结果后自动重置状态，准备下一轮
 // - 发送 {"action": "cancel"} 取消当前轮次识别，重置状态，准备下一轮
 // - 发送 {"action": "close"} 关闭连接
@@ -675,6 +676,13 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 	// 音频缓冲区（用于保存音频文件）
 	var audioBuffer []float32
 	saveAudioEnabled := config.GlobalConfig.Speaker.SaveAudioOnFinish
+	useThreshold := h.manager.threshold
+	if threshold > 0 {
+		useThreshold = threshold
+	}
+	// peek 防抖：默认每 150ms 最多处理一次，避免高频 peek 压垮服务
+	const minPeekInterval = 150 * time.Millisecond
+	var lastPeekAt time.Time
 
 	// 读取消息
 	totalAudioSamples := 0
@@ -722,6 +730,89 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 			if action, ok := controlMsg["action"].(string); ok {
 				logger.Debugf("WebSocket: Control action: %s", action)
 				switch action {
+				case "peek":
+					// 中间结果查询：不结束当前轮次，不重置流式状态
+					requestID, _ := controlMsg["request_id"].(string)
+					now := time.Now()
+					if !lastPeekAt.IsZero() && now.Sub(lastPeekAt) < minPeekInterval {
+						resp := map[string]interface{}{
+							"type":        "partial_result",
+							"is_final":    false,
+							"round":       roundCount + 1,
+							"audio_ms":    float64(len(audioBuffer)) / float64(sampleRate) * 1000,
+							"audio_count": len(audioBuffer),
+							"throttled":   true,
+							"message":     "peek throttled",
+						}
+						if requestID != "" {
+							resp["request_id"] = requestID
+						}
+						if err := conn.WriteJSON(resp); err != nil {
+							logger.Warnf("WebSocket: Failed to send throttled partial_result: %v", err)
+						}
+						continue
+					}
+					lastPeekAt = now
+
+					resp := map[string]interface{}{
+						"type":        "partial_result",
+						"is_final":    false,
+						"round":       roundCount + 1,
+						"audio_ms":    float64(len(audioBuffer)) / float64(sampleRate) * 1000,
+						"audio_count": len(audioBuffer),
+					}
+					if requestID != "" {
+						resp["request_id"] = requestID
+					}
+
+					// 没有音频时直接返回空结果，避免创建识别器
+					if len(audioBuffer) == 0 {
+						resp["result"] = &IdentifyResult{
+							Identified:  false,
+							SpeakerID:   "",
+							SpeakerName: "",
+							Confidence:  0.0,
+							Threshold:   useThreshold,
+						}
+						resp["message"] = "no audio received yet"
+						if err := conn.WriteJSON(resp); err != nil {
+							logger.Warnf("WebSocket: Failed to send empty partial_result: %v", err)
+						}
+						continue
+					}
+
+					// 复制当前音频快照，避免后续轮次复用时被覆盖
+					audioSnapshot := make([]float32, len(audioBuffer))
+					copy(audioSnapshot, audioBuffer)
+
+					var peekResult *IdentifyResult
+					var identifyErr error
+					if threshold > 0 {
+						peekResult, identifyErr = h.manager.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioSnapshot, sampleRate, threshold)
+					} else {
+						peekResult, identifyErr = h.manager.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioSnapshot, sampleRate)
+					}
+
+					if identifyErr != nil {
+						resp["result"] = &IdentifyResult{
+							Identified:  false,
+							SpeakerID:   "",
+							SpeakerName: "",
+							Confidence:  0.0,
+							Threshold:   useThreshold,
+						}
+						resp["error"] = identifyErr.Error()
+						if err := conn.WriteJSON(resp); err != nil {
+							logger.Warnf("WebSocket: Failed to send partial_result error: %v", err)
+						}
+						continue
+					}
+
+					resp["result"] = peekResult
+					if err := conn.WriteJSON(resp); err != nil {
+						logger.Warnf("WebSocket: Failed to send partial_result: %v", err)
+					}
+
 				case "finish":
 					// 完成当前轮次识别
 					roundCount++
@@ -833,6 +924,13 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 			}
 
 			sampleCount := len(message) / 4
+			if sampleCount == 0 {
+				conn.WriteJSON(map[string]interface{}{
+					"type":    "error",
+					"message": "empty audio chunk",
+				})
+				continue
+			}
 			audioData := make([]float32, sampleCount)
 			for i := 0; i < len(audioData); i++ {
 				bits := binary.LittleEndian.Uint32(message[i*4 : (i+1)*4])
@@ -862,10 +960,8 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 				return
 			}
 
-			// 如果启用了保存音频，将数据追加到缓冲区
-			if saveAudioEnabled {
-				audioBuffer = append(audioBuffer, audioData...)
-			}
+			// 始终保留当前轮次音频，用于 peek 中间识别与可选的落盘
+			audioBuffer = append(audioBuffer, audioData...)
 
 			totalAudioSamples += sampleCount
 			audioChunkCount++

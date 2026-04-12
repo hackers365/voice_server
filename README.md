@@ -171,6 +171,89 @@ ws.onopen = () => ws.send(audioBuffer);
 ws.onmessage = e => console.log('识别结果:', e.data);
 ```
 
+### 声纹流式识别 WebSocket（`/api/v1/speaker/identify_ws`）
+
+用于声纹识别的独立 WebSocket 接口（支持多轮识别、`peek` 中间结果）。
+
+连接地址示例：
+```text
+ws://localhost:8080/api/v1/speaker/identify_ws?uid=u1&agent_id=a1&sample_rate=16000&threshold=0.6
+```
+
+查询参数：
+- `uid`：可选，用户ID（建议必传，生产环境应做隔离）
+- `agent_id`：可选，代理ID（建议必传）
+- `sample_rate`：可选，默认 `16000`
+- `threshold`：可选，识别阈值（>0 时生效）
+
+音频数据格式：
+- 使用二进制帧发送
+- 内容为 `float32` 小端序 PCM（单声道，范围建议 `[-1, 1]`）
+
+控制消息（文本 JSON）：
+- `{"action":"peek","request_id":"r1"}`：获取当前轮次中间结果，不结束轮次
+- `{"action":"finish"}`：结束当前轮次并返回最终结果，随后自动进入下一轮
+- `{"action":"cancel"}`：取消当前轮次，清空状态，进入下一轮
+- `{"action":"close"}`：关闭连接
+
+`peek` 频率限制：
+- 服务端默认对 `peek` 做约 `150ms` 防抖
+- 建议客户端按 `200ms` 周期发起 `peek`
+- 触发防抖时返回 `partial_result`，并带 `throttled: true`
+
+服务端返回消息类型：
+- `connection`：连接成功
+- `audio_received`：收到音频块确认
+- `partial_result`：`peek` 返回的中间结果（`is_final=false`）
+- `result`：`finish` 返回的最终结果
+- `ready`：服务端已重置，可开始下一轮
+- `cancelled` / `closing` / `error`
+
+`partial_result` 示例：
+```json
+{
+  "type": "partial_result",
+  "request_id": "r1",
+  "is_final": false,
+  "round": 1,
+  "audio_ms": 1250,
+  "audio_count": 20000,
+  "result": {
+    "identified": true,
+    "speaker_id": "spk_001",
+    "speaker_name": "Alice",
+    "confidence": 0.82,
+    "threshold": 0.6
+  }
+}
+```
+
+JavaScript 使用示例（中途多次 `peek`）：
+```javascript
+const ws = new WebSocket('ws://localhost:8080/api/v1/speaker/identify_ws?uid=u1&agent_id=a1&sample_rate=16000');
+ws.binaryType = 'arraybuffer';
+
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.type === 'partial_result') console.log('中间结果:', msg);
+  if (msg.type === 'result') console.log('最终结果:', msg.result);
+};
+
+ws.onopen = async () => {
+  // 连续发送音频块（float32 PCM 小端序）
+  for (const chunk of audioChunks) {
+    ws.send(chunk);
+  }
+
+  // 中途查询（可多次）
+  ws.send(JSON.stringify({ action: 'peek', request_id: 'p1' }));
+  ws.send(JSON.stringify({ action: 'peek', request_id: 'p2' }));
+
+  // 结束当前轮
+  ws.send(JSON.stringify({ action: 'finish' }));
+};
+```
+
 
 ## 🏛️ 系统架构
 

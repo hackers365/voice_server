@@ -9,7 +9,6 @@ import (
 	"voice_server/internal/logger"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/spf13/viper"
 )
 
 // HotReloadManager 配置热加载管理器
@@ -96,15 +95,16 @@ func (m *HotReloadManager) handleConfigChange() {
 // reloadConfig 重新加载配置
 func (m *HotReloadManager) reloadConfig() {
 	logger.Infof("🔄 Reloading configuration...")
+	vp := config.GetViper()
 
 	// 重新读取配置文件
-	if err := viper.ReadInConfig(); err != nil {
+	if err := vp.ReadInConfig(); err != nil {
 		logger.Errorf("❌ Failed to read config file: %v", err)
 		return
 	}
 
 	// 重新解析配置
-	if err := viper.Unmarshal(&config.GlobalConfig); err != nil {
+	if err := vp.Unmarshal(&config.GlobalConfig); err != nil {
 		logger.Errorf("❌ Failed to unmarshal config: %v", err)
 		return
 	}
@@ -146,15 +146,16 @@ func (m *HotReloadManager) Stop() {
 
 // GetConfigValue 获取配置值
 func (m *HotReloadManager) GetConfigValue(key string) interface{} {
-	return viper.Get(key)
+	return config.GetViper().Get(key)
 }
 
 // SetConfigValue 设置配置值
 func (m *HotReloadManager) SetConfigValue(key string, value interface{}) error {
-	viper.Set(key, value)
+	vp := config.GetViper()
+	vp.Set(key, value)
 
 	// 重新解析到结构体
-	if err := viper.Unmarshal(&config.GlobalConfig); err != nil {
+	if err := vp.Unmarshal(&config.GlobalConfig); err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
@@ -166,5 +167,5 @@ func (m *HotReloadManager) SetConfigValue(key string, value interface{}) error {
 
 // SaveConfig 保存配置到文件
 func (m *HotReloadManager) SaveConfig() error {
-	return viper.WriteConfig()
+	return config.GetViper().WriteConfig()
 }

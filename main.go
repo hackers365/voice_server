@@ -43,6 +43,14 @@ func main() {
 		logger.Errorf("Failed to initialize app dependencies:%v", err)
 		os.Exit(1)
 	}
+	defer func() {
+		if deps.HotReloadMgr != nil {
+			deps.HotReloadMgr.Stop()
+		}
+		if deps.Engine != nil {
+			deps.Engine.Shutdown()
+		}
+	}()
 
 	// 统一注册所有路由
 	r := router.NewRouter(deps)
@@ -50,7 +58,7 @@ func main() {
 	// 创建HTTP服务器
 	server := &http.Server{
 		Addr:        fmt.Sprintf("%s:%d", config.GlobalConfig.Server.Host, config.GlobalConfig.Server.Port),
-		Handler:     deps.RateLimiter.Middleware(r),
+		Handler:     r,
 		ReadTimeout: time.Duration(config.GlobalConfig.Server.ReadTimeout) * time.Second,
 	}
 

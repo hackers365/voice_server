@@ -1,15 +1,14 @@
 package ws
 
 import (
-	"voice_server/config"
-	"voice_server/internal/logger"
-	"voice_server/internal/session"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
 	"time"
 
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	"voice_server/config"
+	"voice_server/core"
+	"voice_server/internal/logger"
 
 	"github.com/gorilla/websocket"
 )
@@ -30,8 +29,8 @@ func GenerateSessionID() string {
 }
 
 // HandleWebSocket 处理 WebSocket 连接
-// 依赖注入 sessionManager, globalRecognizer
-func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager *session.Manager, globalRecognizer *sherpa.OfflineRecognizer) {
+// 依赖注入 sessionManager
+func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager core.SessionManager) {
 	conn, err := Upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Errorf("WebSocket upgrade failed: %v", err)
@@ -44,21 +43,10 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager *ses
 		conn.SetReadDeadline(time.Now().Add(time.Duration(wsConfig.ReadTimeout) * time.Second))
 	}
 
-	// 检查recognition是否启用，如果未启用则直接返回
-	if !config.GlobalConfig.Recognition.Enabled {
-		logger.Warnf("Recognition is disabled, closing WebSocket connection")
-		conn.WriteJSON(map[string]interface{}{
-			"type":    "error",
-			"message": "Recognition service is disabled",
-		})
-		conn.Close()
-		return
-	}
-
 	sessionID := GenerateSessionID()
 
 	// 创建会话
-	sess, err := sessionManager.CreateSession(sessionID, conn)
+	err = sessionManager.CreateSession(sessionID, conn)
 	if err != nil {
 		logger.Errorf("Failed to create session, session_id=%s, error=%v", sessionID, err)
 		conn.Close()
@@ -71,19 +59,6 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager *ses
 	}()
 
 	logger.Infof("New WebSocket connection established, session_id=%s", sessionID)
-
-	// 发送连接确认
-	if sess != nil {
-		select {
-		case sess.SendQueue <- map[string]interface{}{
-			"type":       "connection",
-			"message":    "WebSocket connected, ready for audio",
-			"session_id": sessionID,
-		}:
-		default:
-			logger.Warnf("Session send queue is full, dropping connection confirmation")
-		}
-	}
 
 	// 处理消息
 	for {
@@ -106,19 +81,8 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request, sessionManager *ses
 
 		// 处理音频数据
 		if len(message) > 0 {
-			if err := sessionManager.ProcessAudioData(sessionID, message); err != nil {
+			if err := sessionManager.HandleAudioMessage(sessionID, message); err != nil {
 				logger.Errorf("Failed to process audio data, session_id=%s, error=%v", sessionID, err)
-				// 通过session的SendQueue发送错误消息
-				if sess != nil {
-					select {
-					case sess.SendQueue <- map[string]interface{}{
-						"type":    "error",
-						"message": err.Error(),
-					}:
-					default:
-						logger.Warnf("Session send queue is full, dropping error message")
-					}
-				}
 			}
 		}
 	}

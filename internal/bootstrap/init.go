@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-
 	"voice_server/config"
+	"voice_server/core"
 	"voice_server/internal/config/hotreload"
 	"voice_server/internal/logger"
-	"voice_server/internal/middleware"
 	"voice_server/internal/pool"
+	"voice_server/internal/ratelimit"
 	"voice_server/internal/session"
 	"voice_server/internal/speaker"
 
@@ -17,9 +17,8 @@ import (
 )
 
 type AppDependencies struct {
-	SessionManager   *session.Manager
-	VADPool          pool.VADPoolInterface
-	RateLimiter      *middleware.RateLimiter
+	Engine           core.Engine
+	RateLimiter      *ratelimit.RateLimiter
 	SpeakerManager   *speaker.Manager
 	SpeakerHandler   *speaker.Handler
 	GlobalRecognizer *sherpa.OfflineRecognizer
@@ -43,7 +42,13 @@ func createRecognizer(cfg *config.Config) (*sherpa.OfflineRecognizer, error) {
 
 	recognizer := sherpa.NewOfflineRecognizer(&c)
 	if recognizer == nil {
-		return nil, fmt.Errorf("failed to create offline recognizer")
+		return nil, fmt.Errorf(
+			"failed to create offline recognizer (model_path=%s, tokens_path=%s, provider=%s, num_threads=%d)",
+			cfg.Recognition.ModelPath,
+			cfg.Recognition.TokensPath,
+			cfg.Recognition.Provider,
+			cfg.Recognition.NumThreads,
+		)
 	}
 
 	return recognizer, nil
@@ -127,25 +132,12 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 		return nil, fmt.Errorf("failed to initialize VAD pool: %v", err)
 	}
 
-	// 初始化会话管理器
-	logger.Infof("🔧 Initializing session manager...")
-	sessionManager := session.NewManager(globalRecognizer, vadPool)
-
 	// 注册配置热加载回调
 	registerHotReloadCallbacks(hotReloadMgr)
 
-	// 初始化速率限制器
-	logger.Infof("🔧 Initializing rate limiter... requests_per_second=%d, max_connections=%d", cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.MaxConnections)
-	rateLimiter := middleware.NewRateLimiter(
-		cfg.RateLimit.Enabled,
-		cfg.RateLimit.RequestsPerSecond,
-		cfg.RateLimit.BurstSize,
-		cfg.RateLimit.MaxConnections,
-	)
-
 	// 初始化声纹识别模块
 	var speakerManager *speaker.Manager
-	var speakerHandler *speaker.Handler
+	var speakerService core.SpeakerService
 	if cfg.Speaker.Enabled {
 		if _, statErr := os.Stat(cfg.Speaker.ModelPath); !os.IsNotExist(statErr) {
 			speakerConfig := &speaker.Config{
@@ -188,7 +180,7 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 			mgr, err := speaker.NewManager(speakerConfig, vadPool)
 			if err == nil {
 				speakerManager = mgr
-				speakerHandler = speaker.NewHandler(speakerManager)
+				speakerService = newSpeakerServiceAdapter(mgr)
 			} else {
 				logger.Warnf("Failed to initialize speaker recognition module, continuing without it: %v", err)
 			}
@@ -197,10 +189,38 @@ func InitApp(cfg *config.Config) (*AppDependencies, error) {
 		}
 	}
 
+	asrEngine := core.NewEngine(globalRecognizer, vadPool, speakerService)
+
+	// 初始化速率限制器
+	logger.Infof("🔧 Initializing rate limiter... requests_per_second=%d, max_connections=%d", cfg.RateLimit.RequestsPerSecond, cfg.RateLimit.MaxConnections)
+	rateLimiter := ratelimit.NewRateLimiter(
+		cfg.RateLimit.Enabled,
+		cfg.RateLimit.RequestsPerSecond,
+		cfg.RateLimit.BurstSize,
+		cfg.RateLimit.MaxConnections,
+	)
+	guardedEngine, err := core.NewGuardedEngine(asrEngine, rateLimiter, func(engine core.Engine) core.SessionManager {
+		return session.NewManager(engine)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize guarded engine: %v", err)
+	}
+
+	// 会话管理器实现由外部提供，但由 Engine 在构造时创建并持有
+	logger.Infof("🔧 Initializing session manager...")
+	sessionManager := guardedEngine.GetSessionManager()
+	if sessionManager == nil {
+		return nil, fmt.Errorf("session manager is not initialized")
+	}
+
+	var speakerHandler *speaker.Handler
+	if speakerManager != nil {
+		speakerHandler = speaker.NewHandler(guardedEngine)
+	}
+
 	logger.Infof("✅ All components initialized successfully")
 	return &AppDependencies{
-		SessionManager:   sessionManager,
-		VADPool:          vadPool,
+		Engine:           guardedEngine,
 		RateLimiter:      rateLimiter,
 		SpeakerManager:   speakerManager,
 		SpeakerHandler:   speakerHandler,

@@ -3,6 +3,7 @@ package speaker
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"mime/multipart"
@@ -12,7 +13,9 @@ import (
 	"strings"
 	"time"
 	"voice_server/config"
+	"voice_server/core"
 	"voice_server/internal/logger"
+	"voice_server/internal/ratelimit"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-audio/audio"
@@ -22,13 +25,44 @@ import (
 
 // Handler 声纹识别HTTP处理器
 type Handler struct {
-	manager *Manager
+	engine core.Engine
 }
 
-// NewHandler 创建新的处理器
-func NewHandler(manager *Manager) *Handler {
+func writeEngineError(c *gin.Context, err error, failureMessage string) {
+	if errors.Is(err, ratelimit.ErrRateLimitExceeded) || errors.Is(err, ratelimit.ErrTooManyConnections) {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error": fmt.Sprintf("%s: %v", failureMessage, err),
+	})
+}
+
+func writeSpeakerDomainError(c *gin.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(err.Error(), "not found") {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": err.Error(),
+		})
+		return true
+	}
+	if strings.Contains(err.Error(), "belongs to different uid") {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": err.Error(),
+		})
+		return true
+	}
+	return false
+}
+
+// NewHandler 创建新的处理器。
+func NewHandler(engine core.Engine) *Handler {
 	return &Handler{
-		manager: manager,
+		engine: engine,
 	}
 }
 
@@ -185,30 +219,19 @@ func (h *Handler) RegisterSpeaker(c *gin.Context) {
 		return
 	}
 
-	// 使用VAD过滤静音，保留前后100ms的静音
-	filteredAudio, err := h.manager.FilterSilenceWithVADKeepEdges(audioData, sampleRate)
+	// 注册声纹，具体处理逻辑下沉到 Engine（HTTP 仅做参数包装）
+	err = h.engine.RegisterSpeaker(uid, agentID, speakerID, speakerName, uuid, audioData, sampleRate)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("failed to filter silence: %v", err),
-		})
-		return
-	}
-
-	// 注册声纹（使用过滤后的音频）
-	err = h.manager.RegisterSpeaker(uid, agentID, speakerID, speakerName, uuid, filteredAudio, sampleRate)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("failed to register speaker: %v", err),
-		})
+		writeEngineError(c, err, "failed to register speaker")
 		return
 	}
 
 	// 保存音频文件（异步保存，不阻塞响应）
 	go func() {
-		if err := saveRegisterAudioToWAV(filteredAudio, sampleRate, uid, agentID); err != nil {
+		if err := saveRegisterAudioToWAV(audioData, sampleRate, uid, agentID); err != nil {
 			logger.Warnf("Failed to save register audio file: %v", err)
 		} else {
-			logger.Infof("Register audio file saved successfully, samples: %d", len(filteredAudio))
+			logger.Infof("Register audio file saved successfully, samples: %d", len(audioData))
 		}
 	}()
 
@@ -274,16 +297,14 @@ func (h *Handler) IdentifySpeaker(c *gin.Context) {
 	}
 
 	// 识别声纹（如果提供了阈值则使用，否则使用默认值）
-	var result *IdentifyResult
+	var result *core.SpeakerIdentifyResult
 	if threshold > 0 {
-		result, err = h.manager.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioData, sampleRate, threshold)
+		result, err = h.engine.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioData, sampleRate, threshold)
 	} else {
-		result, err = h.manager.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioData, sampleRate)
+		result, err = h.engine.IdentifySpeaker(uid, agentID, speakerID, speakerName, audioData, sampleRate)
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("failed to identify speaker: %v", err),
-		})
+		writeEngineError(c, err, "failed to identify speaker")
 		return
 	}
 
@@ -332,17 +353,12 @@ func (h *Handler) VerifySpeaker(c *gin.Context) {
 	}
 
 	// 验证声纹
-	result, err := h.manager.VerifySpeaker(uid, agentID, speakerID, audioData, sampleRate)
+	result, err := h.engine.VerifySpeaker(uid, agentID, speakerID, audioData, sampleRate)
 	if err != nil {
-		if strings.Contains(err.Error(), "belongs to different uid") {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": err.Error(),
-			})
+		if writeSpeakerDomainError(c, err) {
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("failed to verify speaker: %v", err),
-		})
+		writeEngineError(c, err, "failed to verify speaker")
 		return
 	}
 
@@ -363,7 +379,7 @@ func (h *Handler) GetAllSpeakers(c *gin.Context) {
 	// 获取 Agent ID（可选）
 	agentID := getAgentIDFromRequest(c)
 
-	speakers := h.manager.GetAllSpeakers(uid, agentID)
+	speakers := h.engine.GetAllSpeakers(uid, agentID)
 	c.JSON(http.StatusOK, gin.H{
 		"uid":      uid,
 		"agent_id": agentID,
@@ -393,23 +409,12 @@ func (h *Handler) DeleteSpeaker(c *gin.Context) {
 	uuid := c.Query("uuid")
 	if uuid != "" {
 		// 通过 UUID 删除
-		err := h.manager.DeleteSpeakerByUUID(uid, agentID, uuid)
+		err := h.engine.DeleteSpeakerByUUID(uid, agentID, uuid)
 		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				c.JSON(http.StatusNotFound, gin.H{
-					"error": err.Error(),
-				})
+			if writeSpeakerDomainError(c, err) {
 				return
 			}
-			if strings.Contains(err.Error(), "belongs to different uid") {
-				c.JSON(http.StatusForbidden, gin.H{
-					"error": err.Error(),
-				})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": fmt.Sprintf("failed to delete speaker: %v", err),
-			})
+			writeEngineError(c, err, "failed to delete speaker")
 			return
 		}
 
@@ -431,23 +436,12 @@ func (h *Handler) DeleteSpeaker(c *gin.Context) {
 		return
 	}
 
-	err := h.manager.DeleteSpeaker(uid, agentID, speakerID)
+	err := h.engine.DeleteSpeaker(uid, agentID, speakerID)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": err.Error(),
-			})
+		if writeSpeakerDomainError(c, err) {
 			return
 		}
-		if strings.Contains(err.Error(), "belongs to different uid") {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": err.Error(),
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": fmt.Sprintf("failed to delete speaker: %v", err),
-		})
+		writeEngineError(c, err, "failed to delete speaker")
 		return
 	}
 
@@ -465,7 +459,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 	uid := getUIDFromRequest(c)
 	// Agent ID 是可选的
 	agentID := getAgentIDFromRequest(c)
-	stats := h.manager.GetStats(uid, agentID)
+	stats := h.engine.GetSpeakerStats(uid, agentID)
 	c.JSON(http.StatusOK, stats)
 }
 
@@ -628,16 +622,24 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 	speakerName := c.Query("speaker_name")
 
 	// 创建流式识别器的辅助函数
-	createIdentifier := func() *StreamingIdentifier {
+	createIdentifier := func() (core.SpeakerStreamingSession, error) {
 		logger.Debugf("WebSocket: Creating streaming identifier for uid: %s, agent_id: %s, speaker_id: %s, speaker_name: %s, sample rate: %d Hz, threshold: %.4f", uid, agentID, speakerID, speakerName, sampleRate, threshold)
 		if threshold > 0 {
-			return h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate, threshold)
+			return h.engine.NewSpeakerStreamingSession(uid, agentID, speakerID, speakerName, sampleRate, threshold)
 		}
-		return h.manager.NewStreamingIdentifier(uid, agentID, speakerID, speakerName, sampleRate)
+		return h.engine.NewSpeakerStreamingSession(uid, agentID, speakerID, speakerName, sampleRate)
 	}
 
 	// 创建初始流式识别器
-	identifier := createIdentifier()
+	identifier, err := createIdentifier()
+	if err != nil {
+		logger.Errorf("WebSocket: Failed to create streaming identifier: %v", err)
+		conn.WriteJSON(map[string]interface{}{
+			"type":    "error",
+			"message": err.Error(),
+		})
+		return
+	}
 	defer func() {
 		if identifier != nil {
 			identifier.Close()
@@ -828,7 +830,16 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 						})
 						// 重置状态，准备下一轮（即使出错也允许继续）
 						identifier.Close()
-						identifier = createIdentifier()
+						identifier, err = createIdentifier()
+						if err != nil {
+							logger.Errorf("WebSocket: Failed to recreate streaming identifier after error: %v", err)
+							conn.WriteJSON(map[string]interface{}{
+								"type":    "error",
+								"message": err.Error(),
+								"round":   roundCount,
+							})
+							return
+						}
 						audioBuffer = nil
 						totalAudioSamples = 0
 						audioChunkCount = 0
@@ -861,7 +872,16 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 
 					// 重置状态，准备下一轮识别
 					identifier.Close()
-					identifier = createIdentifier()
+					identifier, err = createIdentifier()
+					if err != nil {
+						logger.Errorf("WebSocket: Failed to recreate streaming identifier for next round: %v", err)
+						conn.WriteJSON(map[string]interface{}{
+							"type":    "error",
+							"message": err.Error(),
+							"round":   roundCount,
+						})
+						return
+					}
 					audioBuffer = nil
 					totalAudioSamples = 0
 					audioChunkCount = 0
@@ -878,7 +898,16 @@ func (h *Handler) IdentifySpeakerWebSocket(c *gin.Context) {
 					// 取消当前轮次识别，重置状态
 					logger.Infof("WebSocket: Cancel action received (round %d), resetting state", roundCount+1)
 					identifier.Close()
-					identifier = createIdentifier()
+					identifier, err = createIdentifier()
+					if err != nil {
+						logger.Errorf("WebSocket: Failed to recreate streaming identifier after cancel: %v", err)
+						conn.WriteJSON(map[string]interface{}{
+							"type":    "error",
+							"message": err.Error(),
+							"round":   roundCount + 1,
+						})
+						return
+					}
 					audioBuffer = nil
 					totalAudioSamples = 0
 					audioChunkCount = 0

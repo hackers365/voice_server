@@ -13,7 +13,7 @@ import (
 	"voice_server/internal/session"
 	"voice_server/internal/speaker"
 
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	sherpa "github.com/hackers365/sherpa-onnx-go/sherpa_onnx"
 )
 
 type AppDependencies struct {

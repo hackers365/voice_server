@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	sherpa "github.com/hackers365/sherpa-onnx-go/sherpa_onnx"
 )
 
 // Pool 资源池接口 - 统一不同池实现的接口

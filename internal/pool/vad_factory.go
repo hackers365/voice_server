@@ -6,7 +6,7 @@ import (
 	"voice_server/config"
 	"voice_server/internal/logger"
 
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	sherpa "github.com/hackers365/sherpa-onnx-go/sherpa_onnx"
 )
 
 // VADFactory VAD工厂

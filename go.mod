@@ -8,7 +8,7 @@ require (
 	github.com/go-audio/audio v1.0.0
 	github.com/go-audio/wav v1.1.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/k2-fsa/sherpa-onnx-go v1.12.4
+	github.com/hackers365/sherpa-onnx-go v1.12.4-h365.1
 	github.com/qdrant/go-client v1.16.2
 	github.com/spf13/viper v1.20.1
 	golang.org/x/time v0.14.0
@@ -28,10 +28,10 @@ require (
 	github.com/go-playground/validator/v10 v10.20.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
 	github.com/goccy/go-json v0.10.2 // indirect
+	github.com/hackers365/sherpa-onnx-go-linux v1.12.4-denoise.4 // indirect
+	github.com/hackers365/sherpa-onnx-go-macos v1.12.4-denoise.4 // indirect
+	github.com/hackers365/sherpa-onnx-go-windows v1.12.4-denoise.4 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-linux v1.12.4 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-macos v1.12.4 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-windows v1.12.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.7 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

@@ -11,7 +11,7 @@ import (
 	"voice_server/internal/logger"
 	"voice_server/internal/pool"
 
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	sherpa "github.com/hackers365/sherpa-onnx-go/sherpa_onnx"
 )
 
 // Manager 声纹识别管理器

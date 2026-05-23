@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	sherpa "github.com/hackers365/sherpa-onnx-go/sherpa_onnx"
 
 	"github.com/gorilla/websocket"
 )
